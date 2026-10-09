@@ -248,6 +248,49 @@ def test_remap_carries_off_batch_state():
     assert state[:2] == ["B", "A"], f"state must sit at each request's row: {state}"
 
 
+def test_chunked_prefill_keeps_state_when_an_earlier_request_finishes():
+    r = _runner()
+    assert _prefill(r, ["A", "B"]) == [0, 1]
+    state = ["A", "B"] + [None] * (SLOTS - 2)
+    _release(r, finished=["A"])
+    r.requests.pop("A")
+
+    # B's next chunk arrives at host row 0. Its recurrent state is still in
+    # device slot 1: allocating slot 0 does not copy or reset that state.
+    assert _prefill(r, ["B"]) == [1]
+    _assert_state_found(r, state)
+    state = _gather(state, _decode(r, ["B"]))
+    _assert_state_found(r, state)
+
+
+@pytest.mark.parametrize("rows", [["B", "A"], ["C", "A", "B"]])
+def test_prefill_continuations_reserve_their_state_before_new_rows(rows):
+    r = _runner()
+    assert _prefill(r, ["A", "B"]) == [0, 1]
+    state = ["A", "B"] + [None] * (SLOTS - 2)
+
+    slots = _prefill(r, rows)
+    for req_id, slot in zip(rows, slots):
+        if req_id == "C":
+            assert state[slot] is None, "new prefill overwrote a continuation"
+            state[slot] = req_id
+        else:
+            assert state[slot] == req_id, "continuation read another request's state"
+    _assert_state_found(r, state)
+
+
+def test_chunked_prefill_uses_the_state_location_after_interleaved_decode():
+    r = _runner()
+    assert _prefill(r, ["A", "B", "D"]) == [0, 1, 2]
+    state = ["A", "B", "D"] + [None] * (SLOTS - 3)
+    # D decodes while A/B still have prompt chunks to compute. The full
+    # permutation moves A/B too; their next chunks must use the new owners.
+    state = _gather(state, _decode(r, ["D"]))
+    _assert_state_found(r, state)
+    assert _prefill(r, ["B", "A"]) == [state.index("B"), state.index("A")]
+    _assert_state_found(r, state)
+
+
 def test_preemption_releases_its_state_slot():
     """The wiring: ``_update_states`` must actually call the release pass. The tests
     above drive ``_release_dead_state_slots`` directly and would not notice its loss."""
