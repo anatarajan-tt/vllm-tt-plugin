@@ -1006,9 +1006,12 @@ class TTModelRunner:
         self.input_batch.refresh_logitsprocs()
 
     def _validate_mm_feature(self, mm_feature: MultiModalFeatureSpec) -> None:
-        """Validate the multimodal feature is an image."""
-        if mm_feature.modality != "image":
-            raise NotImplementedError("Only images are supported for now")
+        """Validate the multimodal feature is an image or a video."""
+        if mm_feature.modality not in ("image", "video"):
+            raise NotImplementedError(
+                f"Unsupported multimodal modality {mm_feature.modality!r}: "
+                "only 'image' and 'video' are supported for now"
+            )
 
     def _gather_multi_modal_inputs(
         self, req_indices: list[int] | None = None
@@ -1016,31 +1019,25 @@ class TTModelRunner:
         """
         Gather and batch multi-modal inputs for the current persistent batch.
 
-        Currently only supports image inputs in the "pixel_values" and
-        "image_grid_thw" fields.
+        Supports image inputs ("pixel_values", "image_grid_thw") and video
+        inputs ("pixel_values_videos", "video_grid_thw").
 
-        Returns a dict with keys "pixel_values" and "image_grid_thw".
-        Each value is a list aligned with the persistent batch order
-        (`self.input_batch.req_ids[:num_reqs]`).
+        Returns a dict whose values are lists aligned with `req_indices`
+        (default: the persistent batch order). The video keys are only
+        present when at least one row has a video feature, so image-only
+        models see exactly the same kwargs as before.
 
-        For request i:
-        - If it has no `mm_features`, the entry is None.
-        - Otherwise the entry is a list aligned with that request's
-          `mm_features` (currently only images), where each element is a
-          tensor (or None if that feature has no data).
+        For request i and each modality:
+        - If it has no feature of that modality, the entry is None.
+        - Otherwise the entry is a list of per-item tensors (or None if that
+          feature has no data), in the order of the request's `mm_features`.
 
-        Example (3 scheduled requests: text-only, 1 image, 2 images):
+        Example (3 requests: text-only, 1 image, 1 image + 1 video):
         {
-          "pixel_values": [
-            None,
-            [pv_req1_img0],
-            [pv_req2_img0, pv_req2_img1],
-          ],
-          "image_grid_thw": [
-            None,
-            [ig_req1_img0],
-            [ig_req2_img0, ig_req2_img1],
-          ],
+          "pixel_values": [None, [pv_r1_img0], [pv_r2_img0]],
+          "image_grid_thw": [None, [ig_r1_img0], [ig_r2_img0]],
+          "pixel_values_videos": [None, None, [pvv_r2_vid0]],
+          "video_grid_thw": [None, None, [vg_r2_vid0]],
         }
         """
 
@@ -1048,6 +1045,8 @@ class TTModelRunner:
             "pixel_values": [],
             "image_grid_thw": [],
         }
+        video_pv_rows: list[list[torch.Tensor | None] | None] = []
+        video_grid_rows: list[list[torch.Tensor | None] | None] = []
 
         if req_indices is None:
             req_indices = list(range(self.input_batch.num_reqs))
@@ -1060,29 +1059,42 @@ class TTModelRunner:
             if not req_state.mm_features:
                 multi_modal_kwargs["pixel_values"].append(None)
                 multi_modal_kwargs["image_grid_thw"].append(None)
+                video_pv_rows.append(None)
+                video_grid_rows.append(None)
                 continue
 
             pv_array: list[torch.Tensor | None] = []
             image_grid_thw_array: list[torch.Tensor | None] = []
+            vpv_array: list[torch.Tensor | None] = []
+            vgrid_array: list[torch.Tensor | None] = []
             for mm_feature in req_state.mm_features:
                 self._validate_mm_feature(mm_feature)
+                is_video = mm_feature.modality == "video"
+                if is_video:
+                    pv_list, grid_list = vpv_array, vgrid_array
+                    pv_key, grid_key = "pixel_values_videos", "video_grid_thw"
+                else:
+                    pv_list, grid_list = pv_array, image_grid_thw_array
+                    pv_key, grid_key = "pixel_values", "image_grid_thw"
                 item = mm_feature.data
                 if item is None:
-                    pv_array.append(None)
-                    image_grid_thw_array.append(None)
+                    pv_list.append(None)
+                    grid_list.append(None)
                     continue
                 # With prefix caching, an image whose tokens are fully inside the
                 # cached prefix arrives with its tensor payload stripped; M-RoPE
                 # models keep the CPU-side grid so positions can still be built.
-                pv_array.append(
-                    item["pixel_values"].data if "pixel_values" in item else None
-                )
-                image_grid_thw_array.append(
-                    item["image_grid_thw"].data if "image_grid_thw" in item else None
-                )
+                pv_list.append(item[pv_key].data if pv_key in item else None)
+                grid_list.append(item[grid_key].data if grid_key in item else None)
 
-            multi_modal_kwargs["pixel_values"].append(pv_array)
-            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array)
+            multi_modal_kwargs["pixel_values"].append(pv_array or None)
+            multi_modal_kwargs["image_grid_thw"].append(image_grid_thw_array or None)
+            video_pv_rows.append(vpv_array or None)
+            video_grid_rows.append(vgrid_array or None)
+
+        if any(r is not None for r in video_pv_rows):
+            multi_modal_kwargs["pixel_values_videos"] = video_pv_rows
+            multi_modal_kwargs["video_grid_thw"] = video_grid_rows
 
         return multi_modal_kwargs
 
