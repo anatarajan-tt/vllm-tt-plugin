@@ -101,3 +101,14 @@ def test_unsupported_modality_rejected():
     f = SimpleNamespace(modality="audio", data=None)
     with pytest.raises(NotImplementedError, match="audio"):
         _gather([[f]])
+
+
+def test_stripped_item_yields_none_payload():
+    stripped = SimpleNamespace(
+        modality="image",
+        identifier="abc123",
+        data={"image_grid_thw": _field(torch.tensor([[1, 2, 2]]))},
+    )
+    out = _gather([[stripped]])
+    assert out["pixel_values"] == [[None]]
+    assert out["image_grid_thw"][0][0].tolist() == [[1, 2, 2]]

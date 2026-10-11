@@ -414,6 +414,13 @@ class TTScheduler(AsyncScheduler):
     )
 
     def add_request(self, request: Request) -> None:
+        if request.mm_features:
+            # The TT runner re-runs the vision tower from token 0 on every
+            # prefill, but vLLM's strip_covered_mm_data drops the pixel payload
+            # of any mm item fully covered by a prefix-cache hit. Never read
+            # the prefix cache for multimodal requests so payloads stay intact.
+            # (A plain attribute, derived once in Request.__init__.)
+            request.skip_reading_prefix_cache = True
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
             if existing is not None and existing.streaming_queue is None:
