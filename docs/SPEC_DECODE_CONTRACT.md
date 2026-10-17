@@ -29,7 +29,10 @@ serve speculative decoding within the following execution limits:
 - two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
   what the model declares (section 4h). A plan must offer at least one of
   them; `fused_sample` has no runner path. An ordinary narrow decode does not
-  send `spec_mode`.
+  send `spec_mode`. A model offering `logits` may also offer **`topk`**: the
+  exact top-M candidates of every column instead of the full vocabulary, which
+  the runner asks for, when `VLLM_TT_SPEC_DEVICE_TOPK=1`, on a sampled step
+  whose rows the support can serve (section 4i).
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
   distribution under the row's own temperature, top-k, top-p, presence,
@@ -1029,6 +1032,85 @@ persistent batch may have moved on, and reads nothing else. The walk draws
 from the requests' own generators, so it must run once per step;
 `DeferredDecodeOutput` resolves a step exactly once, so a request's generator
 advances once however many callers race to resolve it.
+
+## 4i. The `topk` accept mode
+
+A `logits` verify moves `B x (1+K) x V` values to the host on every sampled
+step. For a model whose verify logits are vocabulary-sharded over its devices,
+the exact per-column top-M can be computed and gathered on the device
+instead, and a row with a top_k below M can be sampled from that support
+with the arithmetic the `logits` walk's fast path already uses. The `topk`
+mode carries that: it is a readback optimisation of `logits`, not a new
+sampling semantics, and a plan offering it must offer `logits` too
+(`resolve_speculative_plan` refuses `topk` without it).
+
+**What the model declares.** `topk` in `SpecPlan.accept_modes` and
+`SpecPlan.topk_candidates = M`, the candidates per column its verify returns
+(at least 2). The support serves a request top_k of at most `M - 1`.
+
+**When the runner asks for it.** `TTModelRunner._spec_mode_for_step` asks
+for `argmax_ids` while every live row is certifiable by id equality, as
+before. Otherwise it asks for `topk` when the plan offers it,
+`VLLM_TT_SPEC_DEVICE_TOPK` is not `0` (the default is `0` until the device
+path is validated), the fast path is on (`VLLM_TT_SPEC_FAST_TOPK` not `0`,
+`VLLM_TT_SPEC_TIE_EXACT` not `1`), and every live row is either certifiable or
+*support-servable*; otherwise it asks for `logits`. A row is support-servable
+(`spec_accept.params_support_servable`, plus the batch's penalty sets) when
+its top_k is in `[1, M - 1]`, with any top_p and any temperature, and it
+carries none of the controls that move or mask tokens outside the support:
+the three penalties, logprobs, structured output, `allowed_token_ids`,
+`bad_words`, or a `min_tokens` the output has not reached. The step runs
+with `perform_device_sampling=False`, as a `logits` step does. The runner's
+`TT submissions:` log line counts `topk` verifies after the `logits` count.
+
+**What the model returns.** `VerifyOutput(spec_mode="topk", argmax_ids,
+topk_values, topk_ids, fetch_logits)`: `argmax_ids` `[B, 1+K]` as in
+`argmax_ids` mode; `topk_values` a floating point `[B, 1+K, M]` of each
+column's M largest raw logits (no temperature) and `topk_ids` the matching
+integer token ids, both sorted by value descending then token id ascending,
+every submitted row included; and `fetch_logits`, a callable returning the
+step's full `[B, 1+K, V]` floating point logits. The runner checks the three
+shapes against the submitted block and `topk_candidates` and raises naming
+the field. `fetch_logits` is called at most once per step, on the thread that
+walks acceptance, before the next decode call; a model that re-reads the
+device for it needs the verify's rows intact until then, which a synchronous
+launch (`supports_async_spec_decode` absent) guarantees. `None` is allowed
+when the model cannot supply the full logits; an undecidable position (below)
+then raises.
+
+**What the host computes.** `spec_accept.accept_sampled_support` builds the
+same probability table `accept_sampled_drafts` builds from full logits. The
+fast path keeps the top `k + 64` candidates of each column in the order
+(value descending, token id ascending), keeps every candidate whose tempered
+value is at least the k-th, applies top-p to them and softmaxes the kept set;
+the support is that same candidate list cut at M, so for a column it can
+decide the kept ids, the kept tempered values and their softmax are identical
+bit for bit, and the walk after the table (`_walk_table`) is the same code.
+Committed tokens, accepted counts and the consumption of every seeded
+generator and of the global stream therefore equal the `logits` walk's. A
+column is *undecidable* when its tie group at the k-th value reaches the M-th
+candidate: a member may lie past the support, so that column is sampled from
+`fetch_logits()` by the reference path (`apply_top_k_top_p_pytorch` on the
+whole vocabulary), as the fast path samples its own overflow columns. The
+reference path draws the same distribution through a different inverse CDF,
+so on such a step a seeded stream may differ from the `logits` walk's while
+staying distributed as the target. Greedy rows commit by comparing drafts
+with `argmax_ids`. Padding rows commit `argmax_ids[:, 0]`.
+
+**Exactness.** The device returns each vocabulary shard's top-M; the host
+merges the shards' lists under the same order. A token among the global top-M
+has fewer than M tokens above it in its own shard, so it is in that shard's
+list, whatever order the device breaks ties in; a tie group truncated at a
+shard's cut can only be missing members whose value equals the merged M-th
+value, and the overflow rule above routes every column where that value
+reaches the request's k-th to the full logits. `VLLM_TT_SPEC_TOPK_AUDIT=1`
+fetches the full logits on every step and asserts the support table against
+the full-logits table (support set identical, probabilities equal); it is a
+validation switch for a new device path, not a serving mode.
+
+**Not served.** Logprobs need the row's logsumexp and rank, and the
+penalties, grammar and token filters need the vocabulary: such rows keep the
+step in `logits` mode.
 
 ## 5. One request, from prefill to release
 

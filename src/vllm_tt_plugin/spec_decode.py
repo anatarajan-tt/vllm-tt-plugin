@@ -23,7 +23,7 @@ only surfaces inside an accept walk: the inclusive range a valid
 the fields a verify return must carry for it.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -52,11 +52,32 @@ if TYPE_CHECKING:
 #                  describes. It is the only mode that may be followed by a
 #                  verify with accepted_counts=None, because it is the only one
 #                  that leaves an authoritative count on the device.
+#   "topk"         returns the verify argmax ids [B, 1+K] plus, per candidate
+#                  column, the exact top-M logits and their token ids
+#                  [B, 1+K, M], sorted by value descending then token id
+#                  ascending, and a callable that fetches the full [B, 1+K, V]
+#                  logits lazily. The host samples on that support with the
+#                  same arithmetic as the "logits" walk's fast path, so a row
+#                  whose top_k is in [1, M-1] and carries no penalty, filter,
+#                  grammar or logprobs request commits exactly what "logits"
+#                  would, at a readback of 2 x B x (1+K) x M values instead of
+#                  B x (1+K) x V. A row the support cannot decide (a tie group
+#                  at its k-th value reaching the M-th candidate) is sampled
+#                  from the fetched full logits. The runner asks for it only
+#                  when every live row is greedy-certifiable or support-servable
+#                  (section 4i of docs/SPEC_DECODE_CONTRACT.md); a plan offering
+#                  it must offer "logits" too, for the rows that are not.
 ACCEPT_MODE_LOGITS = "logits"
 ACCEPT_MODE_ARGMAX_IDS = "argmax_ids"
 ACCEPT_MODE_FUSED_SAMPLE = "fused_sample"
+ACCEPT_MODE_TOPK = "topk"
 ACCEPT_MODES = frozenset(
-    {ACCEPT_MODE_LOGITS, ACCEPT_MODE_ARGMAX_IDS, ACCEPT_MODE_FUSED_SAMPLE}
+    {
+        ACCEPT_MODE_LOGITS,
+        ACCEPT_MODE_ARGMAX_IDS,
+        ACCEPT_MODE_FUSED_SAMPLE,
+        ACCEPT_MODE_TOPK,
+    }
 )
 
 # Where a drafter's own state lives. The first two describe a cost the runner
@@ -143,6 +164,7 @@ MODE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     ACCEPT_MODE_LOGITS: ("logits",),
     ACCEPT_MODE_ARGMAX_IDS: ("argmax_ids",),
     ACCEPT_MODE_FUSED_SAMPLE: ("accepted_token_ids", "accepted_counts"),
+    ACCEPT_MODE_TOPK: ("argmax_ids", "topk_values", "topk_ids"),
 }
 
 
@@ -198,6 +220,11 @@ class SpecPlan:
     # stays ``1 + effective_k`` wide either way. Empty means ``effective_k`` at
     # every batch size.
     k_by_rows: tuple[tuple[int, int], ...] = ()
+    # Candidates per column a "topk" verify returns (the M of its
+    # ``[B, 1+K, M]`` fields), and so the largest request top_k the support
+    # can serve plus one. Required with "topk" among accept_modes, None
+    # otherwise.
+    topk_candidates: int | None = None
 
     def __post_init__(self) -> None:
         if self.effective_k < 1:
@@ -277,6 +304,22 @@ class SpecPlan:
                 f"{k_by_rows!r}"
             )
         object.__setattr__(self, "k_by_rows", k_by_rows)
+
+        offers_topk = ACCEPT_MODE_TOPK in modes
+        if offers_topk and (
+            not _is_int(self.topk_candidates) or self.topk_candidates < 2
+        ):
+            raise ValueError(
+                "SpecPlan.topk_candidates must be an integer of at least 2 when "
+                f"accept_modes offers {ACCEPT_MODE_TOPK!r} (a support of M "
+                "candidates serves top_k up to M-1), got "
+                f"{self.topk_candidates!r}"
+            )
+        if not offers_topk and self.topk_candidates is not None:
+            raise ValueError(
+                f"SpecPlan.topk_candidates={self.topk_candidates!r} is meaningful "
+                f"only with {ACCEPT_MODE_TOPK!r} among accept_modes {list(modes)}"
+            )
 
     @property
     def accepted_counts_range(self) -> tuple[int, int]:
@@ -409,6 +452,19 @@ class VerifyOutput:
     # handed back to propose_draft_tokens uninterpreted. None when the model
     # retains it on device.
     hidden: HiddenHandle = None
+    # [B, 1+K, M] for "topk": the exact top-M raw logit values (floating point)
+    # and their token ids (integer) of every candidate column, sorted by value
+    # descending then token id ascending, M = SpecPlan.topk_candidates.
+    topk_values: "torch.Tensor | None" = None
+    topk_ids: "torch.Tensor | None" = None
+    # For "topk": fetches this step's full [B, 1+K, V] logits (floating point,
+    # every submitted row), for rows the support cannot decide. Called at most
+    # once per step, on the thread that walks acceptance, before the next
+    # decode call; a model that re-reads the device here therefore needs the
+    # verify's rows to be intact until then, which a synchronous spec launch
+    # (no supports_async_spec_decode) guarantees. None when the model cannot
+    # supply them, in which case an undecidable row is an error.
+    fetch_logits: "Callable[[], torch.Tensor] | None" = None
 
     def __post_init__(self) -> None:
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
@@ -595,6 +651,7 @@ __all__ = [
     "ACCEPT_MODE_ARGMAX_IDS",
     "ACCEPT_MODE_FUSED_SAMPLE",
     "ACCEPT_MODE_LOGITS",
+    "ACCEPT_MODE_TOPK",
     "DRAFTER_STATES",
     "DRAFTER_STATE_SHARED_WITH_TARGET",
     "DRAFTER_STATE_INTERNAL",

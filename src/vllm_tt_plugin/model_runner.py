@@ -79,14 +79,19 @@ from vllm_tt_plugin.spec_accept import (
     SpecSamplingInputs,
     SpecTokenFilters,
     accept_sampled_drafts,
+    accept_sampled_support,
+    device_topk_enabled,
+    params_support_servable,
 )
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    ACCEPT_MODE_TOPK,
     PLACEHOLDER_TOKEN_ID,
     SPEC_REQUIREMENT_DEVICE_PROPOSE,
     DraftOutput,
+    VerifyOutput,
     accept_greedy_drafts,
 )
 from vllm_tt_plugin.structured_output import (
@@ -1622,16 +1627,56 @@ class TTModelRunner:
         ids rather than ``[B, 1+K, V]`` logits. One row that needs its target
         distribution makes the whole step ``logits``: the mode is per step, and
         that row would otherwise commit the argmax even with no draft of its
-        own.
+        own. Between the two, ``topk`` (offered by the model and opted in with
+        VLLM_TT_SPEC_DEVICE_TOPK) when every row is either certifiable or
+        support-servable (``_request_is_support_servable``): it reads back
+        ``[B, 1+K, M]`` candidates and commits what ``logits`` would.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         if ACCEPT_MODE_LOGITS not in modes:
             return ACCEPT_MODE_ARGMAX_IDS
         if ACCEPT_MODE_ARGMAX_IDS not in modes:
             return ACCEPT_MODE_LOGITS
-        if all(self._request_is_argmax_certifiable(req_id) for req_id in row_req_ids):
+        certifiable = [self._request_is_argmax_certifiable(r) for r in row_req_ids]
+        if all(certifiable):
             return ACCEPT_MODE_ARGMAX_IDS
+        if (
+            ACCEPT_MODE_TOPK in modes
+            and device_topk_enabled()
+            and all(
+                ok or self._request_is_support_servable(req_id)
+                for ok, req_id in zip(certifiable, row_req_ids)
+            )
+        ):
+            return ACCEPT_MODE_TOPK
         return ACCEPT_MODE_LOGITS
+
+    def _request_is_support_servable(self, req_id: str) -> bool:
+        """True when a ``topk`` verify's candidates can sample this request.
+
+        The penalties are read off the batch's sets, as the greedy gate reads
+        them; the rest off the request's own parameters
+        (``params_support_servable``), against the model's declared candidate
+        count.
+        """
+        plan = getattr(self, "_spec_plan", None)
+        if plan is None or plan.topk_candidates is None:
+            return False
+        batch = self.input_batch
+        for attr in (
+            "presence_penalties_reqs",
+            "frequency_penalties_reqs",
+            "repetition_penalties_reqs",
+        ):
+            if req_id in getattr(batch, attr, ()):
+                return False
+        req_state = getattr(self, "requests", {}).get(req_id)
+        params = getattr(req_state, "sampling_params", None)
+        if params is None:
+            return False
+        return params_support_servable(
+            params, len(req_state.output_token_ids), plan.topk_candidates
+        )
 
     def _request_is_argmax_certifiable(self, req_id: str) -> bool:
         """False when this request's sampling cannot be certified by id equality.
@@ -2403,10 +2448,10 @@ class TTModelRunner:
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
-        if spec_mode == ACCEPT_MODE_LOGITS:
-            # The host walk samples from the logits this verify returns, so the
-            # model must not sample on device, and the rows' generators have
-            # to be the requests' own.
+        if spec_mode in (ACCEPT_MODE_LOGITS, ACCEPT_MODE_TOPK):
+            # The host walk samples from the logits (or the top-k support)
+            # this verify returns, so the model must not sample on device, and
+            # the rows' generators have to be the requests' own.
             perform_device_sampling = False
         defer_device_sampling = (
             perform_device_sampling and has_scheduled_structured and not is_prompt
@@ -3138,11 +3183,12 @@ class TTModelRunner:
         one step behind and must not be read or written. Everything this needs
         is the step's own: the block it submitted, the sampling it was built
         with, and what came back. ``tt_out`` is the tensor the step's mode
-        returns, already unwrapped from its ``VerifyOutput``.
+        returns, already unwrapped from its ``VerifyOutput``, or for ``topk``
+        the ``VerifyOutput`` itself (``_verify_output_tensor``).
 
-        An ``argmax_ids`` walk is pure. A ``logits`` walk draws: it advances
-        the generators of the step's seeded requests and the global torch
-        stream, so it must run exactly once per step, which
+        An ``argmax_ids`` walk is pure. A ``logits`` or ``topk`` walk draws: it
+        advances the generators of the step's seeded requests and the global
+        torch stream, so it must run exactly once per step, which
         ``DeferredDecodeOutput`` guarantees on the asynchronous path.
         """
         row_req_ids = model_input.row_req_ids
@@ -3161,6 +3207,8 @@ class TTModelRunner:
 
         if model_input.spec_mode == ACCEPT_MODE_LOGITS:
             return self._walk_sampled_acceptance(model_input, tt_out)
+        if model_input.spec_mode == ACCEPT_MODE_TOPK:
+            return self._walk_support_acceptance(model_input, tt_out)
         if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
             raise NotImplementedError(
                 f"the runner drives no accept walk for spec_mode "
@@ -3241,6 +3289,61 @@ class TTModelRunner:
         committed = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
         committed[:live] = result.committed_token_ids
         committed[live:, 0] = logits[live:, 0].argmax(dim=-1).to(torch.int32)
+        counts = torch.ones(rows, dtype=torch.int32)
+        counts[:live] = result.accepted_counts
+        return SpecWalk(committed, counts, result.logprobs)
+
+    def _walk_support_acceptance(self, model_input: TTModelInput, out: Any) -> SpecWalk:
+        """Rejection-sample one ``topk`` verify on its exact top-M support.
+
+        The three fields are checked against the submitted block and the
+        plan's candidate count, for the same reason ``_walk_sampled_acceptance``
+        checks its logits: a shorter support would be sampled as if it were the
+        top-M, and a narrower block would shift the bonus column. Padding rows
+        commit their own argmax id, which the verify already holds, so no
+        full-vocabulary argmax is needed for them.
+        """
+        if not isinstance(out, VerifyOutput) or out.spec_mode != ACCEPT_MODE_TOPK:
+            raise TypeError(
+                "a verify in topk mode must reach the walk as its VerifyOutput, "
+                f"got {type(out).__name__}"
+            )
+        plan = getattr(self, "_spec_plan", None)
+        if plan is None or plan.topk_candidates is None:
+            raise RuntimeError(
+                "a topk verify reached the walk on a launch whose SpecPlan "
+                "declares no topk_candidates; _spec_mode_for_step asks for topk "
+                "only when the plan offers it"
+            )
+        rows, width = (int(size) for size in model_input.input_tokens.shape)
+        m = int(plan.topk_candidates)
+        for name, expected in (
+            ("argmax_ids", (rows, width)),
+            ("topk_values", (rows, width, m)),
+            ("topk_ids", (rows, width, m)),
+        ):
+            got = tuple(getattr(out, name).shape)
+            if got != expected:
+                raise ValueError(
+                    f"a verify in topk mode must return {name} of shape {expected}: "
+                    "every submitted row, every candidate column and the plan's "
+                    f"topk_candidates={m}. Got {got}"
+                )
+        sampling = _spec_sampling_inputs(model_input, int(self.vocab_size))
+        live = len(model_input.row_req_ids)
+        fetch = out.fetch_logits
+        result = accept_sampled_support(
+            out.argmax_ids[:live],
+            out.topk_values[:live],
+            out.topk_ids[:live],
+            model_input.draft_token_ids[:live],
+            model_input.num_valid_drafts[:live],
+            sampling,
+            None if fetch is None else (lambda: fetch()[:live]),
+        )
+        committed = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+        committed[:live] = result.committed_token_ids
+        committed[live:, 0] = out.argmax_ids[live:, 0].to(torch.int32)
         counts = torch.ones(rows, dtype=torch.int32)
         counts[:live] = result.accepted_counts
         return SpecWalk(committed, counts, result.logprobs)

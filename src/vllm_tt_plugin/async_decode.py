@@ -20,6 +20,7 @@ from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    ACCEPT_MODE_TOPK,
     MODE_REQUIRED_FIELDS,
     PLACEHOLDER_TOKEN_ID,
     VerifyOutput,
@@ -27,8 +28,10 @@ from vllm_tt_plugin.spec_decode import (
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 
-def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch.Tensor:
-    """The one tensor a verify's mode returns, unwrapped from ``VerifyOutput``.
+def _verify_output_tensor(
+    tt_out: Any, model_name: str, spec_mode: str
+) -> torch.Tensor | VerifyOutput:
+    """What a verify's mode returns, unwrapped from ``VerifyOutput``.
 
     A step that sent ``spec_mode`` asked the model to verify a candidate
     block, and a ``VerifyOutput`` is the only answer to that question. A model
@@ -45,6 +48,10 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
     vocabulary indices of float rows, and ``[B, 1+K]`` ids read as logits
     would be sampled over a block-width vocabulary. ``VerifyOutput`` has
     already checked that the field its mode declares is present.
+
+    ``argmax_ids`` and ``logits`` each return one tensor. ``topk`` returns the
+    ``VerifyOutput`` itself: its walk reads three fields and the lazy
+    ``fetch_logits`` callable, and the output already pairs them.
     """
     if not isinstance(tt_out, VerifyOutput):
         raise TypeError(
@@ -65,6 +72,8 @@ def _verify_output_tensor(tt_out: Any, model_name: str, spec_mode: str) -> torch
         return tt_out.argmax_ids
     if spec_mode == ACCEPT_MODE_LOGITS:
         return tt_out.logits
+    if spec_mode == ACCEPT_MODE_TOPK:
+        return tt_out
     raise NotImplementedError(
         f"the runner drives no accept walk for spec_mode {spec_mode!r}"
     )
@@ -388,6 +397,7 @@ class TTAsyncDecodeController:
         # The verifies among those that asked for logits, which is the one
         # observable that says a launch serving both modes chose per step.
         self._logits_verify_submissions = 0
+        self._topk_verify_submissions = 0
 
     @staticmethod
     def _clone_page_tables(model_input: TTModelInput) -> tuple[torch.Tensor, ...]:
@@ -728,17 +738,22 @@ class TTAsyncDecodeController:
             self._verify_submissions += 1
             if model_input.spec_mode == ACCEPT_MODE_LOGITS:
                 self._logits_verify_submissions += 1
+            elif model_input.spec_mode == ACCEPT_MODE_TOPK:
+                self._topk_verify_submissions += 1
         total = self._ordinary_decode_submissions + self._verify_submissions
         if total % _SUBMISSION_LOG_INTERVAL == 0:
             # Parsed by tests/tt/spec/bench_spec_overhead.py and
-            # tests/tt/spec/test_sampled_speculation.py; keep them in step.
+            # tests/tt/spec/test_sampled_speculation.py, which match the line
+            # up to the logits count; the topk count is appended after it.
             logger.info(
                 "TT submissions: %d ordinary decode, %d verify, "
-                "%d overlapped an outstanding step, %d verify in logits mode",
+                "%d overlapped an outstanding step, %d verify in logits mode, "
+                "%d verify in topk mode",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
                 self._logits_verify_submissions,
+                self._topk_verify_submissions,
             )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:

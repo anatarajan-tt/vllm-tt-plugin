@@ -22,6 +22,7 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
     ACCEPT_MODE_LOGITS,
+    ACCEPT_MODE_TOPK,
     DRAFTER_STATE_PAGED,
     HIDDEN_HANDOFF_ROUNDTRIP,
     HIDDEN_HANDOFFS,
@@ -297,6 +298,19 @@ def resolve_speculative_plan(
             f"{model_class.__name__}.spec_plan offers accept modes "
             f"{list(outcome.accept_modes)}, none of which the runner can "
             f"drive; it drives {list(_RUNNABLE_ACCEPT_MODES)}"
+        )
+    if (
+        ACCEPT_MODE_TOPK in outcome.accept_modes
+        and ACCEPT_MODE_LOGITS not in outcome.accept_modes
+    ):
+        # The support walk serves a subset of the rows a logits walk serves;
+        # every other row of a sampled step, and every tie-overflow row, needs
+        # the full logits, so a plan cannot offer the support alone.
+        raise ValueError(
+            f"{model_class.__name__}.spec_plan offers accept mode "
+            f"{ACCEPT_MODE_TOPK!r} without {ACCEPT_MODE_LOGITS!r}; the runner "
+            "asks for topk only on steps whose rows the support serves and "
+            "needs logits for every other sampled step"
         )
 
     # An ordinary decode returns no VerifyOutput, so it produces no hidden

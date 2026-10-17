@@ -70,8 +70,9 @@ arithmetic.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -454,18 +455,11 @@ def accept_speculated_tokens(
     # a batch is usually entirely one or the other. A mixed batch computes both
     # and selects per row, which is what upstream's two kernels do by
     # early-exiting on the row's own flag.
-    accepted = torch.zeros((rows, num_drafts), dtype=torch.bool)
-    candidates = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
-
+    greedy = random = None
     if bool(is_greedy.any()):
-        greedy_accepted, greedy_candidates = _greedy_walk(
-            target_logits, draft_token_ids, num_drafts
-        )
-        accepted = torch.where(is_greedy.unsqueeze(1), greedy_accepted, accepted)
-        candidates = torch.where(is_greedy.unsqueeze(1), greedy_candidates, candidates)
-
+        greedy = _greedy_walk(target_logits, draft_token_ids, num_drafts)
     if bool((~is_greedy).any()):
-        random_accepted, random_candidates = _random_walk(
+        random = _random_walk(
             target_logits,
             draft_token_ids,
             num_valid_drafts,
@@ -479,10 +473,150 @@ def accept_speculated_tokens(
             num_drafts,
             vocab,
         )
-        select = (~is_greedy).unsqueeze(1)
-        accepted = torch.where(select, random_accepted, accepted)
-        candidates = torch.where(select, random_candidates, candidates)
+    return _commit_walks(is_greedy, greedy, random, num_valid_drafts, rows, width)
 
+
+def accept_sampled_support(
+    argmax_ids: torch.Tensor,
+    topk_values: torch.Tensor,
+    topk_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    sampling: SpecSamplingInputs,
+    fetch_logits: Callable[[], torch.Tensor] | None = None,
+) -> AcceptResult:
+    """Walk acceptance on the exact top-M support a ``topk`` verify returns.
+
+    ``topk_values`` and ``topk_ids`` are ``[B, 1+K, M]``: every column's M
+    largest raw logits and their token ids, sorted by value descending then
+    token id ascending. That is exactly what ``_constrained_table`` builds for
+    itself from full logits (the top ``k + margin`` candidates in the same tie
+    order), so the table this builds holds the same ids and the same
+    probabilities for every position the support can decide, and the walk
+    after it is the same code: committed tokens and generator consumption are
+    those of ``accept_sampled_drafts`` on the full logits.
+
+    Greedy rows accept by comparing ids with ``argmax_ids``, which is the
+    verify's own argmax of the same logits. Random rows need a top_k in
+    ``[1, M-1]``; a position whose tie group at the k-th value reaches the
+    M-th candidate cannot be decided from the support (a member may be
+    missing), and such positions are sampled from ``fetch_logits()`` by the
+    reference path, called at most once per step. The penalties, the token
+    filters, the grammar and logprobs all need the full vocabulary and are
+    refused here: ``params_support_servable`` keeps such rows off this walk.
+
+    VLLM_TT_SPEC_TOPK_AUDIT=1 fetches the full logits on every step and checks
+    the support table against the full-logits table, for device validation.
+    """
+    rows, width, m, vocab = _check_support_inputs(
+        argmax_ids,
+        topk_values,
+        topk_ids,
+        draft_token_ids,
+        num_valid_drafts,
+        sampling,
+    )
+    num_drafts = width - 1
+    is_greedy = sampling.temperature <= 0.0
+    fetch = None
+    if fetch_logits is not None:
+        fetch = _FetchOnce(fetch_logits, rows, width, vocab)
+
+    greedy = random = None
+    if bool(is_greedy.any()):
+        greedy = _greedy_accept(argmax_ids.to(torch.int32), draft_token_ids, num_drafts)
+    if bool((~is_greedy).any()):
+        table = _support_table(
+            topk_values,
+            topk_ids,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            vocab,
+            fetch,
+        )
+        if _audit_enabled():
+            _audit_support_table(table, fetch, is_greedy, sampling, rows, width, m)
+        random = _walk_table(
+            table,
+            draft_token_ids,
+            num_valid_drafts,
+            sampling.generators,
+            rows,
+            num_drafts,
+            vocab,
+        )
+    return _commit_walks(is_greedy, greedy, random, num_valid_drafts, rows, width)
+
+
+def params_support_servable(params: Any, output_len: int, candidates: int) -> bool:
+    """Whether a request can be sampled from a top-``candidates`` support alone.
+
+    Read off the request's vLLM ``SamplingParams`` and its committed output
+    length, for ``TTModelRunner._spec_mode_for_step``. Servable: a top_k in
+    ``[1, candidates - 1]`` (top-k keeps the ties at its k-th value, and the
+    overflow rule bounds them inside the support), any top_p, any temperature
+    (a greedy row commits its argmax ids). Everything that moves or masks
+    tokens outside the support needs the full vocabulary: logprobs (a row
+    logsumexp and rank), structured output, ``allowed_token_ids``,
+    ``bad_words`` and a ``min_tokens`` the output has not reached yet, each of
+    which masks an unbounded number of tokens. The penalties also need it (a
+    penalty can lift a token into the top-k from outside the support); the
+    runner reads those off its batch's penalty sets, as it does for the greedy
+    gate, before asking here. ``min_p`` is not read: vLLM refuses a min_p above
+    1e-5 on a speculating launch and the ordinary sampler ignores a smaller
+    one, so neither walk applies it (``_spec_sampling_inputs``).
+    """
+    # vLLM's SamplingParams resets top_k to 0 for a greedy request (temperature
+    # below its _SAMPLING_EPS of 1e-5), and a greedy row needs no support.
+    greedy = float(params.temperature) < 1e-5
+    if not greedy and not 1 <= int(params.top_k) <= candidates - 1:
+        return False
+    return not (
+        params.logprobs is not None
+        or params.structured_outputs is not None
+        or bool(params.allowed_token_ids)
+        or bool(params.bad_words_token_ids)
+        or (params.min_tokens > output_len and bool(params.all_stop_token_ids))
+    )
+
+
+def device_topk_enabled() -> bool:
+    """Whether the runner may ask for the ``topk`` accept mode.
+
+    VLLM_TT_SPEC_DEVICE_TOPK (default 0, until the device path is validated)
+    opts in; the support walk is the fast path's arithmetic, so it also needs
+    the fast path on and the reference tie order off.
+    """
+    return (
+        os.environ.get("VLLM_TT_SPEC_DEVICE_TOPK", "0") != "0"
+        and _fast_enabled()
+        and not _tie_exact()
+    )
+
+
+def _audit_enabled() -> bool:
+    return os.environ.get("VLLM_TT_SPEC_TOPK_AUDIT", "0") == "1"
+
+
+def _commit_walks(
+    is_greedy: torch.Tensor,
+    greedy: tuple[torch.Tensor, torch.Tensor] | None,
+    random: tuple[torch.Tensor, torch.Tensor] | None,
+    num_valid_drafts: torch.Tensor,
+    rows: int,
+    width: int,
+) -> AcceptResult:
+    """Select each row's walk by its temperature and cut the committed prefix."""
+    num_drafts = width - 1
+    accepted = torch.zeros((rows, num_drafts), dtype=torch.bool)
+    candidates = torch.full((rows, width), PLACEHOLDER_TOKEN_ID, dtype=torch.int32)
+    for select, walk in ((is_greedy, greedy), (~is_greedy, random)):
+        if walk is None:
+            continue
+        select = select.unsqueeze(1)
+        accepted = torch.where(select, walk[0], accepted)
+        candidates = torch.where(select, walk[1], candidates)
     accepted_counts = _counts_from_accepted(accepted, num_valid_drafts, num_drafts)
     committed = torch.where(
         _within_count(rows, width, accepted_counts),
@@ -503,6 +637,12 @@ def _greedy_walk(
     in the draft's place; and the bonus position past a row's last draft.
     """
     argmax_ids = target_logits.argmax(dim=-1).to(torch.int32)
+    return _greedy_accept(argmax_ids, draft_token_ids, num_drafts)
+
+
+def _greedy_accept(
+    argmax_ids: torch.Tensor, draft_token_ids: torch.Tensor, num_drafts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     accepted = argmax_ids[:, :num_drafts] == draft_token_ids.to(torch.int32)
     return accepted, argmax_ids
 
@@ -866,36 +1006,9 @@ def _constrained_table(
         k_f = k[ids].to(torch.long)
         cand = min(int(k_f.max()) + _FAST_TOPK_MARGIN, vocab)
         vals, idx = torch.topk(sub, cand, dim=-1)
-        if not _tie_exact():
-            # A fixed tie order: value descending, token id ascending. The
-            # top-p cut below then drops the highest ids of a tie group first.
-            by_id = idx.argsort(dim=1)
-            idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
-            vals, by_value = vals.sort(dim=1, descending=True, stable=True)
-            idx = idx.gather(1, by_value)
-        vals = vals.to(torch.float32) / temp[ids].unsqueeze(1)
-        kth = vals.gather(1, (k_f - 1).unsqueeze(1))
-        keep = vals >= kth
-        # Candidates cannot show how many logits tie with the k-th beyond
-        # the last one they hold, unless that tie is -inf (probability 0).
-        overflow = ((vals[:, -1:] >= kth) & (kth > float("-inf"))).squeeze(1)
-        overflow = overflow & (cand < vocab)
-        vals = vals.masked_fill(~keep, float("-inf"))
-        if p is not None:
-            p_f = p[ids]
-            # The reference's ascending cumsum is the reversed descending one.
-            cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
-            drop = cum <= (1 - p_f).unsqueeze(1)
-            drop[:, 0] = False
-            if _tie_exact():
-                # The reference sort is not stable, so when the cut falls
-                # inside a group of equal logits it keeps an arbitrary member
-                # of the group. Such a row takes the reference path to match.
-                kept = (~drop).sum(dim=1, keepdim=True)
-                nxt = vals.gather(1, kept.clamp(max=cand - 1))
-                last = vals.gather(1, kept - 1)
-                overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
-            vals = vals.masked_fill(drop, float("-inf"))
+        vals, idx, overflow = _support_cut(
+            vals, idx, temp[ids], k_f, None if p is None else p[ids], cand < vocab
+        )
         ok = ~overflow
         if bool(ok.any()):
             table.set_sparse(
@@ -907,16 +1020,228 @@ def _constrained_table(
 
     if bool(fallback.any()):
         ids = fallback.nonzero().squeeze(1)
-        sub = flat[ids].to(torch.float32) / temp[ids].unsqueeze(1)
         k_ref = None if k is None else torch.where(k_on, k, vocab)[ids]
-        out = _reference_top_k_top_p(sub, k_ref, None if p is None else p[ids])
-        dense_rows.append((ids, out.softmax(dim=-1, dtype=torch.float32)))
+        p_ref = None if p is None else p[ids]
+        dense_rows.append((ids, _reference_rows(flat[ids], temp[ids], k_ref, p_ref)))
 
     if dense_rows:
         table.set_dense(
             torch.cat([i for i, _ in dense_rows]), torch.cat([d for _, d in dense_rows])
         )
     return table
+
+
+def _support_cut(
+    vals: torch.Tensor,
+    idx: torch.Tensor,
+    temp: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+    can_overflow: bool | torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Top-k (ties kept) then top-p on per-position candidates.
+
+    ``vals`` and ``idx`` are ``[n, cand]`` value-descending candidates of each
+    flat position, from ``torch.topk`` over full logits or from a device;
+    ``temp`` and ``k`` are ``[n]``, ``p`` is ``[n]`` or None. Returns the
+    tempered values with every dropped candidate at ``-inf``, the ids in the
+    fixed tie order, and per position whether the candidates cannot decide it:
+    a tie group at the k-th value that reaches the last candidate may have
+    members past it, unless ``can_overflow`` says the candidates are the
+    whole vocabulary (or, per position, that the cut is not read at all).
+    """
+    cand = int(vals.shape[1])
+    if not _tie_exact():
+        # A fixed tie order: value descending, token id ascending. The
+        # top-p cut below then drops the highest ids of a tie group first.
+        by_id = idx.argsort(dim=1)
+        idx, vals = idx.gather(1, by_id), vals.gather(1, by_id)
+        vals, by_value = vals.sort(dim=1, descending=True, stable=True)
+        idx = idx.gather(1, by_value)
+    vals = vals.to(torch.float32) / temp.unsqueeze(1)
+    kth = vals.gather(1, (k - 1).unsqueeze(1))
+    keep = vals >= kth
+    # Candidates cannot show how many logits tie with the k-th beyond
+    # the last one they hold, unless that tie is -inf (probability 0).
+    overflow = ((vals[:, -1:] >= kth) & (kth > float("-inf"))).squeeze(1)
+    overflow = overflow & torch.as_tensor(can_overflow)
+    vals = vals.masked_fill(~keep, float("-inf"))
+    if p is not None:
+        # The reference's ascending cumsum is the reversed descending one.
+        cum = torch.cumsum(vals.softmax(dim=-1).flip(-1), dim=-1).flip(-1)
+        drop = cum <= (1 - p).unsqueeze(1)
+        drop[:, 0] = False
+        if _tie_exact():
+            # The reference sort is not stable, so when the cut falls
+            # inside a group of equal logits it keeps an arbitrary member
+            # of the group. Such a row takes the reference path to match.
+            kept = (~drop).sum(dim=1, keepdim=True)
+            nxt = vals.gather(1, kept.clamp(max=cand - 1))
+            last = vals.gather(1, kept - 1)
+            overflow = overflow | ((kept < cand) & (nxt == last)).squeeze(1)
+        vals = vals.masked_fill(drop, float("-inf"))
+    return vals, idx, overflow
+
+
+def _reference_rows(
+    logits: torch.Tensor,
+    temp: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+) -> torch.Tensor:
+    """The reference path's probabilities of the given flat positions."""
+    sub = logits.to(torch.float32) / temp.unsqueeze(1)
+    return _reference_top_k_top_p(sub, k, p).softmax(dim=-1, dtype=torch.float32)
+
+
+class _FetchOnce:
+    """``fetch_logits`` of a ``topk`` verify, called at most once and checked.
+
+    The overflow fallback and the audit both read the full logits; the model
+    replays a device trace for them, so one call serves both.
+    """
+
+    def __init__(
+        self, fetch: Callable[[], torch.Tensor], rows: int, width: int, vocab: int
+    ):
+        self._fetch, self._shape = fetch, (rows, width, vocab)
+        self.calls = 0
+        self.logits: torch.Tensor | None = None
+
+    def __call__(self) -> torch.Tensor:
+        if self.logits is None:
+            self.calls += 1
+            logits = self._fetch()
+            if (
+                not isinstance(logits, torch.Tensor)
+                or not logits.is_floating_point()
+                or tuple(logits.shape) != self._shape
+            ):
+                raise ValueError(
+                    "accept_sampled_support fetch_logits must return floating "
+                    f"point [B, 1+K, V] = {self._shape} logits for the live rows, "
+                    f"got {type(logits).__name__}"
+                    + (
+                        f" of shape {tuple(logits.shape)} dtype {logits.dtype}"
+                        if isinstance(logits, torch.Tensor)
+                        else ""
+                    )
+                )
+            self.logits = logits.to(torch.float32)
+        return self.logits
+
+
+def _support_table(
+    topk_values: torch.Tensor,
+    topk_ids: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    vocab: int,
+    fetch: _FetchOnce | None,
+) -> _ProbTable:
+    """``_constrained_table`` from a verify's exact top-M support.
+
+    The candidates are already the top M by value in the fixed tie order, so
+    ``_support_cut`` applies the same top-k, overflow and top-p arithmetic to
+    them as the fast path applies to its own ``torch.topk`` candidates; the
+    kept prefix of a decidable position is the same ids with the same
+    tempered values, so its softmax is bit-identical. A position the support
+    cannot decide is sampled from the fetched full logits by the reference
+    path, as the fast path's own overflow rows are.
+
+    Greedy positions (temperature 0) take part so that the batched draws of
+    the walk stay in step with the full-logits walk; their results are
+    discarded, so they take the whole support at temperature 1 with no cut
+    and can never overflow.
+    """
+    rows, width, m = topk_values.shape
+    n = rows * width
+    flat_v = topk_values.reshape(n, m)
+    flat_i = topk_ids.reshape(n, m).to(torch.long)
+    temp = _expand_to_columns(_safe_temperature(temperature), width).to(torch.float32)
+    greedy = _expand_to_columns(temperature <= 0.0, width)
+    k = None if top_k is None else _expand_to_columns(top_k, width).to(torch.long)
+    p = None if top_p is None else _expand_to_columns(top_p, width)
+    servable = torch.zeros(n, dtype=torch.bool) if k is None else (k > 0) & (k <= m - 1)
+    bad = ~servable & ~greedy
+    if bool(bad.any()):
+        bad_rows = sorted({int(i) // width for i in bad.nonzero().view(-1).tolist()})
+        shown = None if k is None else [int(k[r * width]) for r in bad_rows]
+        raise ValueError(
+            f"accept_sampled_support rows {bad_rows} sample with top_k {shown} "
+            f"outside [1, {m - 1}], which a support of {m} candidates cannot "
+            "serve; the runner routes such rows to the logits mode"
+        )
+    if k is None:
+        k_eff = torch.full((n,), m, dtype=torch.long)
+    else:
+        k_eff = torch.where(servable, k, m)
+    p_eff = None if p is None else torch.where(servable, p, torch.ones_like(p))
+    vals, idx, overflow = _support_cut(flat_v, flat_i, temp, k_eff, p_eff, servable)
+
+    table = _ProbTable(n, vocab)
+    ok = ~overflow
+    if bool(ok.any()):
+        probs = vals[ok].softmax(dim=-1, dtype=torch.float32)
+        table.set_sparse(ok.nonzero().squeeze(1), idx[ok], probs)
+    if bool(overflow.any()):
+        if fetch is None:
+            raise ValueError(
+                "accept_sampled_support: positions "
+                f"{overflow.nonzero().view(-1).tolist()} tie at their k-th value "
+                f"through the {m}-th candidate and need the full logits, but the "
+                "verify offered no fetch_logits"
+            )
+        ids = overflow.nonzero().squeeze(1)
+        full = fetch().reshape(n, vocab)
+        k_ref = None if k is None else torch.where(servable, k, vocab)[ids]
+        p_ref = None if p is None else p[ids]
+        table.set_dense(ids, _reference_rows(full[ids], temp[ids], k_ref, p_ref))
+    return table
+
+
+def _audit_support_table(
+    table: _ProbTable,
+    fetch: _FetchOnce | None,
+    is_greedy: torch.Tensor,
+    sampling: SpecSamplingInputs,
+    rows: int,
+    width: int,
+    m: int,
+) -> None:
+    """VLLM_TT_SPEC_TOPK_AUDIT: the support table equals the full-logits table.
+
+    For every sampled position the kept token set must be identical and the
+    probabilities equal (bit-identical where both are sparse; the reference
+    path's dense rows differ by rounding). Raises with the first offending
+    position; costs a full-logits readback per step, so it is a validation
+    switch, not a serving mode.
+    """
+    if fetch is None:
+        raise ValueError(
+            "VLLM_TT_SPEC_TOPK_AUDIT=1 needs a verify that offers fetch_logits"
+        )
+    full = fetch()
+    reference = _constrained_table(
+        full, sampling.temperature, sampling.top_k, sampling.top_p, None
+    ).to_dense()
+    got = table.to_dense()
+    sampled = _expand_to_columns(~is_greedy, width)
+    for flat in sampled.nonzero().view(-1).tolist():
+        want, have = reference[flat], got[flat]
+        if not torch.equal(want > 0, have > 0) or not torch.allclose(
+            want, have, rtol=1e-6, atol=1e-9
+        ):
+            diff = (want - have).abs()
+            token = int(diff.argmax())
+            raise AssertionError(
+                f"topk audit: row {flat // width} column {flat % width} differs "
+                f"from the full-logits table at token {token}: support "
+                f"{float(have[token]):.9g} vs full {float(want[token]):.9g} "
+                f"(support size {int((have > 0).sum())}, full {int((want > 0).sum())}, "
+                f"M={m})"
+            )
 
 
 def _point_mass_walk(
@@ -947,8 +1272,27 @@ def _point_mass_walk(
     leaves the generator where that step does; every other seeded draw is a
     uniform.
     """
-    width = num_drafts + 1
     table = _constrained_table(target_logits, temperature, top_k, top_p, min_p)
+    return _walk_table(
+        table, draft_token_ids, num_valid_drafts, generators, rows, num_drafts, vocab
+    )
+
+
+def _walk_table(
+    table: _ProbTable,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    vocab: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The point-mass walk over a built table (see ``_point_mass_walk``).
+
+    Shared by the full-logits and the support entry points: only the table's
+    construction differs between them, and every draw happens here.
+    """
+    width = num_drafts + 1
     valid = num_valid_drafts.to(torch.long)
     draft_ids = draft_token_ids.to(torch.long).clamp(0, vocab - 1)
     row_ids = torch.arange(rows)
@@ -963,7 +1307,9 @@ def _point_mass_walk(
     draftless = {row: g for row, g in generators.items() if int(valid[row]) == 0}
     for row, generator in generators.items():
         if row not in draftless:
-            draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generator)[0]
+            draws[row, 0] = torch.rand(
+                (1,), dtype=torch.float64, generator=generator
+            )[0]
     bonus = table.sample(bonus_ids, draws[:, 0]).to(torch.int32)
     for row, generator in draftless.items():
         noise = torch.empty(vocab, dtype=torch.float32)
@@ -995,7 +1341,9 @@ def _point_mass_walk(
     if corr_rows.numel():
         pos = first[corr_rows]
         recovered = table.sample(
-            corr_rows * width + pos, draws[corr_rows, 1], exclude=draft_ids[corr_rows, pos]
+            corr_rows * width + pos,
+            draws[corr_rows, 1],
+            exclude=draft_ids[corr_rows, pos],
         )
         candidates[corr_rows, pos] = recovered
     candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
@@ -1156,17 +1504,120 @@ def _check_inputs(
             f"got {tuple(target_logits.shape)}"
         )
     rows, width, vocab = target_logits.shape
+    _check_block(
+        "accept_speculated_tokens",
+        f"target_logits {tuple(target_logits.shape)}",
+        rows,
+        width,
+        vocab,
+        draft_token_ids,
+        num_valid_drafts,
+        temperature,
+        min_p,
+    )
+    return rows, width, vocab
+
+
+def _check_support_inputs(
+    argmax_ids: torch.Tensor,
+    topk_values: torch.Tensor,
+    topk_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    sampling: SpecSamplingInputs,
+) -> tuple[int, int, int, int]:
+    """Shapes and domains of a ``topk`` verify's return and its controls."""
+    if argmax_ids.dim() != 2:
+        raise ValueError(
+            "accept_sampled_support argmax_ids must be 2-D [B, 1+K], got "
+            f"{tuple(argmax_ids.shape)}"
+        )
+    rows, width = (int(size) for size in argmax_ids.shape)
+    if (
+        topk_values.dim() != 3
+        or tuple(topk_values.shape[:2]) != (rows, width)
+        or tuple(topk_ids.shape) != tuple(topk_values.shape)
+    ):
+        raise ValueError(
+            "accept_sampled_support topk_values and topk_ids must both be "
+            f"[B, 1+K, M] = [{rows}, {width}, M] to match argmax_ids, got "
+            f"{tuple(topk_values.shape)} and {tuple(topk_ids.shape)}"
+        )
+    if not topk_values.is_floating_point() or topk_ids.is_floating_point():
+        raise TypeError(
+            "accept_sampled_support topk_values must be floating point and "
+            f"topk_ids integer, got {topk_values.dtype} and {topk_ids.dtype}"
+        )
+    m = int(topk_values.shape[2])
+    vocab = sampling.vocab_size
+    if m < 2 or m > vocab:
+        raise ValueError(
+            "accept_sampled_support needs 2 <= M <= vocab candidates, got "
+            f"M={m} with vocab={vocab}"
+        )
+    outside = topk_ids[(topk_ids < 0) | (topk_ids >= vocab)]
+    if outside.numel():
+        raise ValueError(
+            "accept_sampled_support topk_ids must lie in "
+            f"[0, {vocab - 1}], got {outside[:8].tolist()}"
+        )
+    _check_block(
+        "accept_sampled_support",
+        f"argmax_ids {tuple(argmax_ids.shape)}",
+        rows,
+        width,
+        vocab,
+        draft_token_ids,
+        num_valid_drafts,
+        sampling.temperature,
+        None,
+    )
+    _check_sampling(sampling, rows, width, vocab)
+    unsupported = [
+        name
+        for name, value in (
+            ("penalties", sampling.penalties),
+            ("filters", sampling.filters),
+            ("num_logprobs", sampling.num_logprobs),
+        )
+        if value is not None
+    ]
+    if unsupported:
+        raise ValueError(
+            f"accept_sampled_support was handed {unsupported}, which need the "
+            "whole vocabulary; the runner asks for the topk mode only when no "
+            "live row carries them (params_support_servable)"
+        )
+    if not _fast_enabled() or _tie_exact():
+        raise ValueError(
+            "accept_sampled_support is the fast top-k path's arithmetic; a "
+            "launch with VLLM_TT_SPEC_FAST_TOPK=0 or VLLM_TT_SPEC_TIE_EXACT=1 "
+            "must not ask for the topk mode (device_topk_enabled)"
+        )
+    return rows, width, m, vocab
+
+
+def _check_block(
+    caller: str,
+    against: str,
+    rows: int,
+    width: int,
+    vocab: int,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    temperature: torch.Tensor,
+    min_p: torch.Tensor | None,
+) -> None:
     if width < 1:
         raise ValueError(
-            "accept_speculated_tokens target_logits must carry at least the "
-            f"bonus column, got width {width}"
+            f"{caller} target_logits must carry at least the bonus column, got "
+            f"width {width}"
         )
     num_drafts = width - 1
     if draft_token_ids.shape != (rows, num_drafts):
         raise ValueError(
-            f"accept_speculated_tokens draft_token_ids must be [{rows}, "
-            f"{num_drafts}] to match target_logits "
-            f"{tuple(target_logits.shape)}, got {tuple(draft_token_ids.shape)}"
+            f"{caller} draft_token_ids must be [{rows}, {num_drafts}] to match "
+            f"{against}, got {tuple(draft_token_ids.shape)}"
         )
     for name, tensor in (
         ("num_valid_drafts", num_valid_drafts),
@@ -1175,19 +1626,17 @@ def _check_inputs(
     ):
         if tensor is not None and tensor.shape != (rows,):
             raise ValueError(
-                f"accept_speculated_tokens {name} must be [{rows}], got "
-                f"{tuple(tensor.shape)}"
+                f"{caller} {name} must be [{rows}], got {tuple(tensor.shape)}"
             )
     out_of_range = num_valid_drafts[
         (num_valid_drafts < 0) | (num_valid_drafts > num_drafts)
     ]
     if out_of_range.numel():
         raise ValueError(
-            "accept_speculated_tokens num_valid_drafts entries must lie in "
+            f"{caller} num_valid_drafts entries must lie in "
             f"[0, {num_drafts}], got {out_of_range.tolist()}"
         )
     _check_draft_ids(draft_token_ids, num_valid_drafts, num_drafts, vocab)
-    return rows, width, vocab
 
 
 def _check_draft_ids(
@@ -1309,8 +1758,11 @@ __all__ = [
     "SpecSamplingInputs",
     "SpecTokenFilters",
     "accept_sampled_drafts",
+    "accept_sampled_support",
     "accept_speculated_tokens",
     "apply_speculative_penalties",
     "apply_speculative_token_filters",
     "committed_logprobs",
+    "device_topk_enabled",
+    "params_support_servable",
 ]
