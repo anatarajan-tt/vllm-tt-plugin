@@ -118,8 +118,24 @@ class TTDecodeSubmission:
 class TTFinalizedDecode:
     """Normalized decode result after TT event waits and host processing."""
 
-    tt_out: torch.Tensor | TTCompactedHostLogits
+    # A ``topk`` verify finalizes as its ``VerifyOutput``: the accept walk reads
+    # three of its fields and its ``fetch_logits`` callable, so there is no one
+    # tensor to normalize it to.
+    tt_out: torch.Tensor | TTCompactedHostLogits | VerifyOutput
     tt_log_probs: torch.Tensor | None
+
+
+def _device_verify_fields(verify: VerifyOutput) -> dict[str, str]:
+    """The fields ``verify``'s mode reads that are not host tensors, by type name.
+
+    ``hidden`` is an opaque handle the walk never reads and ``fetch_logits`` a
+    callable, so neither is a field here.
+    """
+    return {
+        name: type(getattr(verify, name)).__name__
+        for name in MODE_REQUIRED_FIELDS[verify.spec_mode]
+        if not isinstance(getattr(verify, name), torch.Tensor)
+    }
 
 
 def _is_host_decode_output(tt_out: Any) -> bool:
@@ -129,6 +145,11 @@ def _is_host_decode_output(tt_out: Any) -> bool:
         return all(
             tensor is None or isinstance(tensor, torch.Tensor) for tensor in tt_out
         )
+    if isinstance(tt_out, VerifyOutput):
+        # A verify's return reaches the accept walk as it is (``topk`` is the
+        # mode that is not unwrapped to one tensor), so it is host output when
+        # every field its mode reads already is.
+        return not _device_verify_fields(tt_out)
     return False
 
 
@@ -1386,7 +1407,10 @@ class TTAsyncDecodeController:
             # A verify returns its mode's tensor inside a VerifyOutput, which
             # the read path below and every consumer above expect as a plain
             # host tensor. Unwrapped here, at the one boundary the model
-            # returns through, rather than teaching each of them the type.
+            # returns through, rather than teaching each of them the type. A
+            # ``topk`` verify stays a VerifyOutput, which the read path and
+            # ``finalize_decode`` take for host output by its fields
+            # (``_is_host_decode_output``) and hand to the walk unconverted.
             verify = tt_out
             tt_out = _verify_output_tensor(
                 tt_out, type(runner.model).__name__, requested_spec_mode
@@ -1427,17 +1451,11 @@ class TTAsyncDecodeController:
                         ),
                     ),
                 )
-            else:
-                is_host_tensor = isinstance(tt_out, torch.Tensor)
-                is_host_tensor_tuple = isinstance(tt_out, tuple) and all(
-                    tensor is None or isinstance(tensor, torch.Tensor)
-                    for tensor in tt_out
+            elif not _is_host_decode_output(tt_out):
+                raise AttributeError(
+                    "TT model must implement read_decode_output() "
+                    "unless decode_forward() already returns host tensors"
                 )
-                if not (is_host_tensor or is_host_tensor_tuple):
-                    raise AttributeError(
-                        "TT model must implement read_decode_output() "
-                        "unless decode_forward() already returns host tensors"
-                    )
         return TTDecodeSubmission(
             tt_out=tt_out,
             read_events=read_events,
@@ -1548,6 +1566,18 @@ class TTAsyncDecodeController:
 
         is_host_output = _is_host_decode_output(tt_out)
         compact_rows = None
+        if isinstance(tt_out, VerifyOutput) and not is_host_output:
+            # ``process_decode_output_host`` converts a plain decode's device
+            # output, one per data-parallel rank; it cannot read a VerifyOutput,
+            # and the walk below needs the fields on the host. Refused by name
+            # here rather than inside the model's hook.
+            raise TypeError(
+                f"TT model {type(runner.model).__name__} answered a verify in "
+                f"spec_mode {tt_out.spec_mode!r} with fields that are not host "
+                f"tensors {_device_verify_fields(tt_out)}; a VerifyOutput "
+                "reaches the accept walk as it is, so decode_forward or "
+                "read_decode_output must return its fields as host tensors"
+            )
         if not is_host_output and hasattr(runner.model, "process_decode_output_host"):
             kwargs = {"is_tokens": submission.perform_device_sampling}
             if (

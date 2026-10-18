@@ -546,7 +546,10 @@ Two demands nevertheless reach the model, and they are what
    the `VerifyOutput`, so the hook is handed the mode's `[B, 1+K]` ids or
    `[B, 1+K, V]` logits rather than a decode's single column, and the number
    of tokens per row that will be committed out of it is decided by the host
-   after the forward returns. For `logits`, the host also samples there.
+   after the forward returns. For `logits`, the host also samples there. For
+   `topk` the hook is handed the `VerifyOutput` itself and returns one whose
+   `argmax_ids`, `topk_values` and `topk_ids` are host buffers; the runner
+   waits for the read events and hands that output to the walk unconverted.
 2. **The hidden handle outlives the step's submission.** The model returns it
    from `decode_forward`, the runner carries it across the readback and a
    queue, and `propose_draft_tokens` receives it at the next step's drain. A
@@ -1071,7 +1074,11 @@ integer token ids, both sorted by value descending then token id ascending,
 every submitted row included; and `fetch_logits`, a callable returning the
 step's full `[B, 1+K, V]` floating point logits. The runner checks the three
 shapes against the submitted block and `topk_candidates` and raises naming
-the field. `fetch_logits` is called at most once per step, on the thread that
+the field. The three tensors are host tensors: the runner hands the
+`VerifyOutput` to the accept walk as it is, never to
+`process_decode_output_host`, which converts a plain decode's device output,
+and refuses a field that is not a host tensor by name (`finalize_decode`).
+`fetch_logits` is called at most once per step, on the thread that
 walks acceptance, before the next decode call; a model that re-reads the
 device for it needs the verify's rows intact until then, which a synchronous
 launch (`supports_async_spec_decode` absent) guarantees. `None` is allowed
