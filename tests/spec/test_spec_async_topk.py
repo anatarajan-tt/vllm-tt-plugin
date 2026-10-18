@@ -185,7 +185,7 @@ def test_a_topk_verify_finalizes_as_its_verify_output(topk_on, monkeypatch):
     assert set(model.verify_modes) == {ACCEPT_MODE_TOPK}
     assert model.host_conversions == []
 
-    monkeypatch.delenv("VLLM_TT_SPEC_DEVICE_TOPK")
+    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "0")
     model, runner = _sync_runner()
     sync_harness._add_request(runner, "s", SEEDED)
     reference = _serve(runner, "s", 30)

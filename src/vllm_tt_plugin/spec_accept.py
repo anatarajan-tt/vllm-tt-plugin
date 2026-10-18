@@ -584,12 +584,12 @@ def params_support_servable(params: Any, output_len: int, candidates: int) -> bo
 def device_topk_enabled() -> bool:
     """Whether the runner may ask for the ``topk`` accept mode.
 
-    VLLM_TT_SPEC_DEVICE_TOPK (default 0, until the device path is validated)
-    opts in; the support walk is the fast path's arithmetic, so it also needs
+    VLLM_TT_SPEC_DEVICE_TOPK (default 1; 0 turns it off)
+    opts out; the support walk is the fast path's arithmetic, so it also needs
     the fast path on and the reference tie order off.
     """
     return (
-        os.environ.get("VLLM_TT_SPEC_DEVICE_TOPK", "0") != "0"
+        os.environ.get("VLLM_TT_SPEC_DEVICE_TOPK", "1") != "0"
         and _fast_enabled()
         and not _tie_exact()
     )

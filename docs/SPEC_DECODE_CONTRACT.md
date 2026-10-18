@@ -31,7 +31,7 @@ serve speculative decoding within the following execution limits:
   them; `fused_sample` has no runner path. An ordinary narrow decode does not
   send `spec_mode`. A model offering `logits` may also offer **`topk`**: the
   exact top-M candidates of every column instead of the full vocabulary, which
-  the runner asks for, when `VLLM_TT_SPEC_DEVICE_TOPK=1`, on a sampled step
+  the runner asks for, unless `VLLM_TT_SPEC_DEVICE_TOPK=0`, on a sampled step
   whose rows the support can serve (section 4i).
 - **speculation for every admitted request, on a model serving `logits`.** The
   runner rejection-samples each verify row on the host against the target
@@ -1054,7 +1054,7 @@ sampling semantics, and a plan offering it must offer `logits` too
 **When the runner asks for it.** `TTModelRunner._spec_mode_for_step` asks
 for `argmax_ids` while every live row is certifiable by id equality, as
 before. Otherwise it asks for `topk` when the plan offers it,
-`VLLM_TT_SPEC_DEVICE_TOPK` is not `0` (the default is `0` until the device
+`VLLM_TT_SPEC_DEVICE_TOPK` is not `0` (the default is `1`; the device
 path is validated), the fast path is on (`VLLM_TT_SPEC_FAST_TOPK` not `0`,
 `VLLM_TT_SPEC_TIE_EXACT` not `1`), and every live row is either certifiable or
 *support-servable*; otherwise it asks for `logits`. A row is support-servable

@@ -547,7 +547,7 @@ def test_params_support_servable(params, output_len, servable):
 @pytest.mark.parametrize(
     "env, enabled",
     [
-        ({}, False),
+        ({}, True),
         ({"VLLM_TT_SPEC_DEVICE_TOPK": "1"}, True),
         ({"VLLM_TT_SPEC_DEVICE_TOPK": "0"}, False),
         ({"VLLM_TT_SPEC_DEVICE_TOPK": "1", "VLLM_TT_SPEC_FAST_TOPK": "0"}, False),
@@ -721,7 +721,7 @@ def test_a_servable_sampled_row_makes_the_verify_ask_for_topk(topk_on):
 
 
 def test_the_flag_off_keeps_the_verify_in_logits_mode(monkeypatch):
-    monkeypatch.delenv("VLLM_TT_SPEC_DEVICE_TOPK", raising=False)
+    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "0")
     model, runner = _topk_runner()
     _add_request(runner, "s", SAMPLED)
     assert _mode_for(runner, "s") == ACCEPT_MODE_LOGITS
@@ -797,7 +797,7 @@ def _speculate(runner, req_id: str, count: int) -> tuple[list[int], list[int]]:
 
 def test_topk_and_logits_speculation_commit_the_same_seeded_stream(monkeypatch):
     """The same seeded request, drafted the same way, in both modes."""
-    monkeypatch.delenv("VLLM_TT_SPEC_DEVICE_TOPK", raising=False)
+    monkeypatch.setenv("VLLM_TT_SPEC_DEVICE_TOPK", "0")
     model, runner = _topk_runner()
     _add_request(
         runner, "s", SamplingParams(temperature=1.0, top_k=5, seed=77, ignore_eos=True)
