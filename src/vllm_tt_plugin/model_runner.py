@@ -386,6 +386,40 @@ def _notify_model_slot_moves(runner, moves: dict[int, int]) -> None:
         note(dict(moves))
 
 
+def _prompt_chunk_len(num_scheduled_tokens: int, scheduled_drafts) -> int:
+    """Prompt tokens a prefill row computes this step: its scheduled tokens
+    minus the draft rows scheduled with it.
+
+    vLLM pads a WAITING request whose prefix-cache hit leaves exactly one
+    uncached token to ``1 + num_spec_tokens`` scheduled tokens with
+    ``[-1] * num_spec_tokens`` placeholder drafts (vllm/v1/core/sched/
+    scheduler.py, "Pad new decode requests to uniform spec decoding size"),
+    and ``update_from_output`` rolls ``num_computed_tokens`` back by the
+    rejected placeholders. The placeholder rows are speculative positions,
+    not prompt tokens: a ``prompt_lens`` that counted them made the model
+    prefill ``num_spec_tokens`` positions past the prompt (whatever sat in
+    the token buffer there), and the spec engine then met
+    ``start_pos != prompt length`` on the row's first verify. Only placeholder
+    drafts can reach a prompt row: the scheduler clears real drafts of a
+    request in a prefill chunk, so real ones here are a scheduler bug.
+    """
+    if not scheduled_drafts:
+        return int(num_scheduled_tokens)
+    real = [token for token in scheduled_drafts if token != PLACEHOLDER_TOKEN_ID]
+    if real:
+        raise ValueError(
+            f"a prefill row was scheduled real draft tokens {real!r}; prompt work "
+            "carries only placeholder drafts"
+        )
+    chunk = int(num_scheduled_tokens) - len(scheduled_drafts)
+    if chunk <= 0:
+        raise ValueError(
+            f"a prefill row was scheduled {num_scheduled_tokens} tokens but "
+            f"{len(scheduled_drafts)} placeholder drafts; no prompt token left"
+        )
+    return chunk
+
+
 class TTModelRunner:
     def __init__(
         self,
@@ -2212,8 +2246,18 @@ class TTModelRunner:
             #   tokens too, so the full sequence is replayed to rebuild KV.
             # - Chunked continuation: start_pos=computed, chunk=budget =>
             #   computed + budget, i.e. this chunk's end.
+            # A WAITING request that vLLM padded to ``1 + num_spec_tokens``
+            # tokens (one uncached prompt token left after a prefix-cache hit)
+            # carries placeholder drafts: those rows are not prompt tokens.
+            scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
             chunk_lens = np.array(
-                [num_scheduled[input_batch.req_ids[i]] for i in req_indices],
+                [
+                    _prompt_chunk_len(
+                        num_scheduled[input_batch.req_ids[i]],
+                        scheduled_drafts.get(input_batch.req_ids[i]),
+                    )
+                    for i in req_indices
+                ],
                 dtype=np.int64,
             )
             prompt_lens = input_positions + chunk_lens
