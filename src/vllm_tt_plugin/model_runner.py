@@ -3102,7 +3102,7 @@ class TTModelRunner:
             # the slot remap, and it owns no reset_batch for a verify.
             and (
                 not spec_chain_enabled()
-                or self.async_decode.chain_blocker(scheduler_output) is not None
+                or self.async_decode.chain_forces_drain(scheduler_output)
             )
         ):
             # Preserve the legacy path's drain point: version-0 adapters still

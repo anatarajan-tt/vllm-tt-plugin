@@ -143,6 +143,7 @@ class Engine:
         # The scheduler's own computed-token count: it adds 1+K per scheduled
         # step at once and takes back the rejected ones when the output lands.
         self.computed: dict[str, int] = {}
+        self.prefill_log: list[int] = []
 
     def add(self, req_id, first_token, params=GREEDY, stop_after=None):
         """Admit a request the way a join looks to the runner: it is in the
@@ -164,6 +165,9 @@ class Engine:
         so.num_scheduled_tokens[req_id] = 1
         so.total_num_scheduled_tokens += 1
         self.runner._update_states(so)
+        self._register(req_id, stop_after)
+
+    def _register(self, req_id, stop_after=None):
         used = set(self.runner._req_state_slot.values())
         self.runner._req_state_slot[req_id] = min(set(range(MAX_NUM_REQS)) - used)
         self.live.append(req_id)
@@ -171,6 +175,43 @@ class Engine:
         self.outputs[req_id] = []
         if stop_after is not None:
             self.stop_after[req_id] = stop_after
+
+    def prefill_step(self, news, *, resumed=()):
+        """A prefill-only step through ``execute_model``, submitted over
+        whatever is in flight. Only the device forward is cut: the drain
+        decision, ``_update_states`` and the apply before the build are the
+        real ones. ``prefill_log`` records, at the forward, how many verifies
+        were still unresolved. The step returns no output of its own, so the
+        verify stays the oldest in-flight step, as it does in the engine's FIFO
+        queue. A request in ``news`` is live afterwards, as ``add`` leaves it."""
+        so = _scheduler_output(
+            self.runner,
+            new=[(req_id, first) for req_id, first in news],
+            decoding=tuple(resumed),
+            resumed=resumed,
+        )
+        for new_req in so.scheduled_new_reqs:
+            new_req.sampling_params = GREEDY
+        so.scheduled_cached_reqs = dataclasses.replace(
+            so.scheduled_cached_reqs, num_output_tokens=[0 for _ in resumed]
+        )
+        runner = self.runner
+
+        def forward(scheduler_output, grammar_output):
+            with runner._steady_decode_lock:
+                self.prefill_log.append(
+                    sum(not s.is_resolved() for s in runner._pending_async_steps)
+                )
+            return None
+
+        real_prepare = runner._prepare_model_inputs
+        runner._prepare_model_inputs = forward
+        try:
+            runner.execute_model(so)
+        finally:
+            runner._prepare_model_inputs = real_prepare
+        for req_id, _ in news:
+            self._register(req_id)
 
     def schedule(self):
         finished, self.finished_pending = self.finished_pending, set()
@@ -489,6 +530,121 @@ def test_t6_the_blockers_by_reason(monkeypatch):
     assert controller.chain_blocker(real) == "real_drafts"
     monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "0")
     assert controller.chain_blocker(so()) == "disabled"
+
+
+PREFILL_CAPS = {
+    **FakeSpecModel.model_capabilities,
+    "supports_async_decode": True,
+    "supports_async_spec_decode": True,
+    "supports_prefill_over_pending_spec": True,
+}
+
+
+def _prefill_run(
+    monkeypatch, *, overlap="1", caps=PREFILL_CAPS, news, resumed=(), cycle=(3, 0, 1, 2)
+):
+    """Two requests decoding, a prefill step over the pending verify, more steps.
+
+    Returns the engine, the controller and the number of waits the controller
+    made during the prefill step.
+    """
+    monkeypatch.setenv("VLLM_TT_SPEC_CHAIN", "1")
+    monkeypatch.setenv("VLLM_TT_SPEC_PREFILL_OVERLAP", overlap)
+    model = _chain_model(accept_cycle=cycle, model_capabilities=caps)
+    runner = _make_runner(model)
+    engine = Engine(runner)
+    engine.model = model
+    controller = _controller(runner)
+    waits = []
+    real_wait = controller.wait_for_all_pending_async_steps
+    controller.wait_for_all_pending_async_steps = lambda: (
+        waits.append(1),
+        real_wait(),
+    )[-1]
+    engine.add("a", 1)
+    engine.add("b", 40)
+    for _ in range(5):
+        engine.iterate()
+    assert any(not s.is_resolved() for s in runner._pending_async_steps)
+    before = len(waits)
+    engine.prefill_step(news, resumed=resumed)
+    during = len(waits) - before
+    for _ in range(8):
+        engine.iterate()
+    engine.finish()
+    return engine, controller, during
+
+
+@pytest.mark.parametrize("cycle", [(3, 3, 3, 3), None])
+@pytest.mark.parametrize("news", [[("c", 80)], [("c", 80), ("d", 120)]])
+def test_prefill_overlap_a_prefill_does_not_drain_the_pending_verify(
+    monkeypatch, news, cycle
+):
+    engine, controller, waits = _prefill_run(monkeypatch, news=news, cycle=cycle)
+    assert waits == 0
+    # the verify was still in flight when the prefill forward ran
+    assert engine.prefill_log == [1]
+    assert controller._prefill_overlap_steps == 1
+    # the step after the prefill cannot chain onto the verify it overtook
+    assert controller._chain_breaks["prefill_overlap"] == 1
+    assert controller._overlapped_unsafe_submissions == 0
+    assert "prefill_overlap=1" in controller._chain_report()
+    off, off_controller, off_waits = _prefill_run(
+        monkeypatch, overlap="0", news=news, cycle=cycle
+    )
+    assert off_waits >= 1
+    assert off.prefill_log == [0]
+    assert off_controller._prefill_overlap_steps == 0
+    # the same streams, and the same steps before the prefill
+    # The overlapped run speculates one step more, so after the same number of
+    # steps its streams are longer: equal over the shorter, each one gap-free.
+    for req_id, tokens in engine.outputs.items():
+        shorter = min(len(tokens), len(off.outputs[req_id]))
+        assert shorter > 8
+        assert tokens[:shorter] == off.outputs[req_id][:shorter], req_id
+        assert off.outputs[req_id] == list(
+            range(tokens[0], tokens[0] + len(off.outputs[req_id]))
+        ), req_id
+    assert {k: v for k, v in engine.published.items() if k < 5} == {
+        k: v for k, v in off.published.items() if k < 5
+    }
+    for req_id, tokens in engine.outputs.items():
+        assert len(tokens) > 8
+        assert tokens == list(range(tokens[0], tokens[0] + len(tokens))), req_id
+    # The drain loses the speculation step: committed with its rows out of the
+    # batch, the verify proposes no drafts, so the first decode after the
+    # prefill is draftless; overlapped, it carries the drafts.
+    first_decode = 5
+    assert int(engine.model.chain_log[first_decode]["num_valid_drafts"].sum()) > 0
+    assert int(off.model.chain_log[first_decode]["num_valid_drafts"].sum()) == 0
+
+
+def test_prefill_overlap_needs_the_capability(monkeypatch):
+    caps = {
+        k: v for k, v in PREFILL_CAPS.items() if k != "supports_prefill_over_pending_spec"
+    }
+    engine, controller, waits = _prefill_run(monkeypatch, caps=caps, news=[("c", 80)])
+    assert waits >= 1
+    assert engine.prefill_log == [0]
+    assert controller._prefill_overlap_steps == 0
+
+
+def test_prefill_overlap_kill_switch_drains(monkeypatch):
+    engine, controller, waits = _prefill_run(
+        monkeypatch, overlap="0", news=[("c", 80)]
+    )
+    assert waits >= 1
+    assert engine.prefill_log == [0]
+    assert controller._prefill_overlap_steps == 0
+
+
+def test_prefill_overlap_a_resumed_request_still_drains(monkeypatch):
+    engine, controller, waits = _prefill_run(
+        monkeypatch, news=[("c", 80)], resumed=("a",)
+    )
+    assert waits >= 1
+    assert engine.prefill_log == [0]
+    assert controller._prefill_overlap_steps == 0
 
 
 def test_t6_a_second_pending_step_blocks_the_chain(monkeypatch):

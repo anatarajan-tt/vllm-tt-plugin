@@ -24,6 +24,7 @@ from vllm_tt_plugin.scheduler import (
 from vllm_tt_plugin.spec_accept import (
     spec_chain_enabled,
     spec_chain_sampled_enabled,
+    spec_prefill_overlap_enabled,
     support_fallback_stats,
 )
 from vllm_tt_plugin.spec_decode import (
@@ -466,6 +467,12 @@ class TTAsyncDecodeController:
         self._chained_submissions = 0
         self._chain_breaks: Counter[str] = Counter()
         self._pending_break_reason: str | None = None
+        # Prefill steps that did not drain a pending fused verify
+        # (VLLM_TT_SPEC_PREFILL_OVERLAP).
+        self._prefill_overlap_steps = 0
+        # The verify a prefill was submitted behind: its rows left the
+        # persistent batch at that prefill, so nothing may chain onto it.
+        self._prefill_overlapped_step: DeferredDecodeOutput | None = None
         # Requests the scheduler reported finished while a verify for them may
         # still be in flight; guarded by the runner's steady-decode lock.
         self._late_finished: set[str] = set()
@@ -816,6 +823,8 @@ class TTAsyncDecodeController:
             return "forced_reset", None
         if self.scheduler_output_has_prefill_work(scheduler_output):
             return "prefill", None
+        if unresolved[0] is self._prefill_overlapped_step:
+            return "prefill_overlap", None
         # A request the scheduler left out only because its in-flight step is
         # sure to reach max_tokens is as good as finished: it is not coming
         # back, and the model drops it from the chain overlay.
@@ -836,6 +845,52 @@ class TTAsyncDecodeController:
     def chain_blocker(self, scheduler_output: SchedulerOutput | None) -> str | None:
         """The reason the next step cannot chain, or None when it can."""
         return self.chain_evaluate(scheduler_output)[0]
+
+    def prefill_overlap_allowed(self, scheduler_output: SchedulerOutput | None) -> bool:
+        """Whether a prefill step may be built and submitted over a pending verify.
+
+        Asked only once ``chain_blocker`` has answered "prefill". The step must
+        be all prefill with no resumed request and no multimodal input, the
+        model must declare ``supports_prefill_over_pending_spec`` and
+        VLLM_TT_SPEC_PREFILL_OVERLAP must not be 0. A resumed request still
+        drains: ``apply_ready_completed_decode_steps`` assumes its completed
+        steps are ordered oldest to newest for the forced-reset discard counts.
+        """
+        if scheduler_output is None or not self.chain_enabled():
+            return False
+        if not spec_prefill_overlap_enabled():
+            return False
+        runner = self.runner
+        capabilities = getattr(runner.model, "model_capabilities", {}) or {}
+        if not capabilities.get("supports_prefill_over_pending_spec", False):
+            return False
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        if cached_reqs.resumed_req_ids:
+            return False
+        if not all(
+            cached_reqs.is_context_phase(req_id) for req_id in cached_reqs.req_ids
+        ):
+            return False
+        if any(
+            getattr(new_req, "mm_features", None)
+            for new_req in scheduler_output.scheduled_new_reqs
+        ):
+            return False
+        return not any(
+            getattr(runner.requests.get(req_id), "mm_features", None)
+            for req_id in cached_reqs.req_ids
+        )
+
+    def chain_forces_drain(self, scheduler_output: SchedulerOutput | None) -> bool:
+        """Whether the chain blocker for this step means the verify must drain.
+
+        A blocker forces the drain, except "prefill" when the prefill may be
+        submitted over the pending verify (``prefill_overlap_allowed``).
+        """
+        reason = self.chain_blocker(scheduler_output)
+        if reason is None:
+            return False
+        return not (reason == "prefill" and self.prefill_overlap_allowed(scheduler_output))
 
     def _note_break(self, reason: str | None) -> None:
         """Remember why a chain was refused; counted at the next submission."""
@@ -999,6 +1054,7 @@ class TTAsyncDecodeController:
             f"; chain: {self._chained_submissions} chained fused steps, "
             f"{sum(self._chain_breaks.values())} chain breaks"
             + (f" ({breaks})" if breaks else "")
+            + f", prefill_overlap={self._prefill_overlap_steps}"
         )
 
     def _log_overlap_counters(self, *, force: bool = False) -> None:
@@ -1179,6 +1235,11 @@ class TTAsyncDecodeController:
             reason = self.chain_blocker(scheduler_output)
             if reason is None:
                 return
+            if reason == "prefill" and self.prefill_overlap_allowed(scheduler_output):
+                # The steps already completed are applied above; the verify
+                # stays in flight and commits before the next decode build.
+                self._prefill_overlapped_step = self._last_fused_step
+                return
             self._note_break(reason)
             self.wait_for_all_pending_async_steps()
             self.apply_ready_completed_decode_steps(suppress_output_req_ids=suppressed)
@@ -1223,6 +1284,12 @@ class TTAsyncDecodeController:
             # it, or nothing may be built over a verify and everything drains.
             reason = self.chain_blocker(scheduler_output)
             if reason is None:
+                return False
+            if reason == "prefill" and self.prefill_overlap_allowed(scheduler_output):
+                # The prefill reads nothing the verify produces and the device
+                # queue is in order: submit it behind the verify.
+                self._prefill_overlap_steps += 1
+                self._prefill_overlapped_step = self._last_fused_step
                 return False
             self._note_break(reason)
             return True

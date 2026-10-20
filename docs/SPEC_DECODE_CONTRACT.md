@@ -112,6 +112,7 @@ launches without `speculative_config`.
 | `output_tokens_per_step` | `1` | Must stay `1`. A value above 1 selects the block-output rail, which cannot be combined with speculation. |
 | `supports_async_decode` | `False` | Ordinary decode supports split submission/readback and the applicable decode reload contract. The platform disables async scheduling when this capability is absent. |
 | `supports_async_spec_decode` | `False` | Verification output and any hidden handle remain valid through deferred readback and proposal: see section 4c. Required when speculation is configured and async scheduling remains enabled after the ordinary capability check. |
+| `supports_prefill_over_pending_spec` | `False` | `prefill_forward` may run while one deferred fused verify is in flight, and that verify stays readable afterwards: see section 4j. Only used with `VLLM_TT_SPEC_CHAIN=1`. |
 
 A model never names a vLLM speculative method. The plugin owns the mapping from
 a method name to the requirements that method places on the model, so a new
@@ -1203,6 +1204,19 @@ no prefill chunk, forced reset, grammar, logprobs, penalties or allowlist; every
 row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. Anything
 else drains first. A request finished at step n has already been scheduled into
 n+1: that output is discarded and the row is absent from n+2.
+
+**`supports_prefill_over_pending_spec`** is a `model_capabilities` key
+(default `False`). It promises that `prefill_forward` may be called while one
+deferred fused verify is still in flight: the prefill touches no state that
+verify reads, the device queue is in order, and the pending handle stays
+readable (and its `propose_draft_tokens` callable) after the prefill returns.
+With chain mode on and the key declared, the runner then does not drain the
+verify before an all-prefill step with no resumed request and no multimodal
+input; it submits the prefill behind the verify and finalizes the verify later,
+before the next decode build. A step after such a prefill does not chain onto
+the verify it overtook. `VLLM_TT_SPEC_PREFILL_OVERLAP=0` (default `1`) turns it
+off. A resumed request, a multimodal request or a model without the key still
+drains first.
 
 ## 5. One request, from prefill to release
 

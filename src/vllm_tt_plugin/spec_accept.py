@@ -678,6 +678,19 @@ def spec_chain_enabled() -> bool:
     return os.environ.get("VLLM_TT_SPEC_CHAIN", "0") not in ("", "0")
 
 
+def spec_prefill_overlap_enabled() -> bool:
+    """Whether a prefill step may be submitted behind a pending fused verify.
+
+    VLLM_TT_SPEC_PREFILL_OVERLAP (default 1; 0 turns it off). Chain mode only.
+    A prefill reads nothing the in-flight verify produces, the device queue is
+    in order and vLLM returns the verify output first, so the runner need not
+    drain the verify before it builds and submits the prefill. Off, every
+    prefill drains the verify as before. The model must also declare
+    ``supports_prefill_over_pending_spec``.
+    """
+    return os.environ.get("VLLM_TT_SPEC_PREFILL_OVERLAP", "1") != "0"
+
+
 def spec_chain_sampled_enabled() -> bool:
     """Whether a fused step with a sampled row may be chained or deferred.
 
