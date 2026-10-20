@@ -70,6 +70,7 @@ arithmetic.
 """
 
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -476,6 +477,44 @@ def accept_speculated_tokens(
     return _commit_walks(is_greedy, greedy, random, num_valid_drafts, rows, width)
 
 
+class _SupportFallbackStats:
+    """Counts how often the topk support walk falls back to full logits."""
+
+    _FIELDS = (
+        "support_steps",
+        "support_positions",
+        "overflow_positions",
+        "fetch_calls",
+        "audit_steps",
+    )
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            for name in self._FIELDS:
+                setattr(self, name, 0)
+
+    def add(self, **counts: int) -> None:
+        with self._lock:
+            for name, value in counts.items():
+                setattr(self, name, getattr(self, name) + int(value))
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {name: getattr(self, name) for name in self._FIELDS}
+
+
+_SUPPORT_STATS = _SupportFallbackStats()
+
+
+def support_fallback_stats() -> dict[str, int]:
+    """A copy of the topk support-walk fallback counters."""
+    return _SUPPORT_STATS.snapshot()
+
+
 def accept_sampled_support(
     argmax_ids: torch.Tensor,
     topk_values: torch.Tensor,
@@ -484,6 +523,7 @@ def accept_sampled_support(
     num_valid_drafts: torch.Tensor,
     sampling: SpecSamplingInputs,
     fetch_logits: Callable[[], torch.Tensor] | None = None,
+    uniforms: torch.Tensor | None = None,
 ) -> AcceptResult:
     """Walk acceptance on the exact top-M support a ``topk`` verify returns.
 
@@ -507,6 +547,12 @@ def accept_sampled_support(
 
     VLLM_TT_SPEC_TOPK_AUDIT=1 fetches the full logits on every step and checks
     the support table against the full-logits table, for device validation.
+
+    ``uniforms`` (``[rows, 1+K+1]``, ``predraw_uniforms``' table) replaces every
+    draw the walk would make: nothing is drawn and no generator advances. It is
+    how a ``fused_sample`` model that accepts on the device consumes the draws
+    the runner made for it, and how a host stand-in for such a model reproduces
+    it.
     """
     rows, width, m, vocab = _check_support_inputs(
         argmax_ids,
@@ -521,6 +567,9 @@ def accept_sampled_support(
     fetch = None
     if fetch_logits is not None:
         fetch = _FetchOnce(fetch_logits, rows, width, vocab)
+    _SUPPORT_STATS.add(
+        support_steps=1, support_positions=int((~is_greedy).sum()) * width
+    )
 
     greedy = random = None
     if bool(is_greedy.any()):
@@ -536,6 +585,7 @@ def accept_sampled_support(
             fetch,
         )
         if _audit_enabled():
+            _SUPPORT_STATS.add(audit_steps=1)
             _audit_support_table(table, fetch, is_greedy, sampling, rows, width, m)
         random = _walk_table(
             table,
@@ -545,6 +595,7 @@ def accept_sampled_support(
             rows,
             num_drafts,
             vocab,
+            uniforms=uniforms,
         )
     return _commit_walks(is_greedy, greedy, random, num_valid_drafts, rows, width)
 
@@ -593,6 +644,105 @@ def device_topk_enabled() -> bool:
         and _fast_enabled()
         and not _tie_exact()
     )
+
+
+def fused_sample_enabled() -> bool:
+    """Whether the runner may ask for the ``fused_sample`` accept mode.
+
+    VLLM_TT_SPEC_FUSED (default 1; 0 turns it off). The model must also offer
+    the mode, and the step's rows must all be greedy (stage S1).
+    """
+    return os.environ.get("VLLM_TT_SPEC_FUSED", "1") != "0"
+
+
+def fused_sampled_enabled() -> bool:
+    """Whether a ``fused_sample`` step may also carry sampled rows (stage S2).
+
+    VLLM_TT_SPEC_FUSED_SAMPLED (default 1; 0 keeps every step with a sampled
+    row on the ``topk`` / ``logits`` modes). Read only for steps that have a
+    sampled row; a greedy-only step is stage S1 whatever this says.
+    """
+    return os.environ.get("VLLM_TT_SPEC_FUSED_SAMPLED", "1") != "0"
+
+
+def spec_chain_enabled() -> bool:
+    """Whether the runner may chain a fused verify onto the one still in flight.
+
+    VLLM_TT_SPEC_CHAIN (default 0; 1 turns it on). Stage S4: the device builds
+    the next verify's inputs from the pending one, so the host submits step n+1
+    before step n's result is read. Off, nothing in the runner or the async
+    controller changes: every verify drains its predecessor as before. The
+    model must also declare ``supports_async_spec_decode``, which it does only
+    when it runs chain and fused.
+    """
+    return os.environ.get("VLLM_TT_SPEC_CHAIN", "0") not in ("", "0")
+
+
+def spec_chain_sampled_enabled() -> bool:
+    """Whether a fused step with a sampled row may be chained or deferred.
+
+    VLLM_TT_SPEC_CHAIN_SAMPLED (default 0; 1 allows it, stage S4a). Until
+    sampled overflow is handled for deferred steps, 0 keeps every fused step
+    with a non-greedy row synchronous (stage S2, host overflow redo) and
+    refuses to chain onto or from one. Greedy-only steps are unaffected.
+    """
+    return os.environ.get("VLLM_TT_SPEC_CHAIN_SAMPLED", "0") not in ("", "0")
+
+
+def predraw_uniforms(
+    generators: dict[int, torch.Generator],
+    rows: int,
+    num_drafts: int,
+    num_valid_drafts: torch.Tensor,
+) -> torch.Tensor:
+    """The ``[rows, 1+K+1]`` fp32 table of every uniform ``_walk_table`` would draw.
+
+    Column 0 is the bonus draw, columns 1..K the accept draws of draft columns
+    0..K-1 and column K+1 the correction draw. The draws are made in the order
+    of ``_walk_table`` and ``_uniform``, so a seeded request's stream and the
+    global stream end up where the host walk would leave them:
+
+    1. global ``torch.rand((rows, 2))`` float64: column 0 bonus, column 1
+       correction, for every row (greedy and padding rows too);
+    2. each seeded row's bonus from its own generator (overwrites column 0);
+    3. global ``torch.rand((rows, K))`` float64: the accepts of every row;
+    4. each seeded row's ``num_valid`` accepts from its own generator, then its
+       correction (overwrites column 1). The correction is drawn for every
+       seeded row with drafts, rejected or not, as the host walk does.
+
+    ``rows`` is the number of LIVE rows (what the walk is handed), not the
+    padded batch: the global draws depend on it. Draws are rounded to float32
+    and clamped below 1.0.
+
+    A seeded row with no valid drafts would draw its bonus as a full-vocabulary
+    exponential race, which needs the whole distribution: ``ValueError``
+    (``TTModelRunner._spec_mode_for_step`` keeps such a step off this mode).
+
+    tt-metal keeps the same function (``spec_fused_sampled.predraw_uniforms``);
+    ``tests/spec/test_spec_fused.py`` pins this copy to ``_walk_table``.
+    """
+    valid = num_valid_drafts.reshape(-1).to(torch.int64).tolist()
+    if len(valid) != rows:
+        raise ValueError(f"num_valid_drafts has {len(valid)} entries for {rows} rows")
+    seeded = sorted(generators)
+    draftless = [row for row in seeded if valid[row] == 0]
+    if draftless:
+        raise ValueError(
+            f"seeded rows {draftless} carry no drafts: their bonus is a "
+            "full-vocabulary exponential race the device cannot run"
+        )
+    draws = torch.rand((rows, 2), dtype=torch.float64)
+    for row in seeded:
+        draws[row, 0] = torch.rand((1,), dtype=torch.float64, generator=generators[row])[0]
+    accepts = torch.rand((rows, num_drafts), dtype=torch.float64)
+    for row in seeded:
+        accepts[row, : valid[row]] = torch.rand(
+            (valid[row],), dtype=torch.float64, generator=generators[row]
+        )
+    for row in seeded:
+        draws[row, 1] = torch.rand((1,), dtype=torch.float64, generator=generators[row])[0]
+    table = torch.cat([draws[:, :1], accepts, draws[:, 1:2]], dim=1).to(torch.float32)
+    return table.clamp(max=float(torch.nextafter(torch.tensor(1.0), torch.tensor(0.0))))
 
 
 def _audit_enabled() -> bool:
@@ -1111,6 +1261,7 @@ class _FetchOnce:
     def __call__(self) -> torch.Tensor:
         if self.logits is None:
             self.calls += 1
+            _SUPPORT_STATS.add(fetch_calls=1)
             logits = self._fetch()
             if (
                 not isinstance(logits, torch.Tensor)
@@ -1182,6 +1333,7 @@ def _support_table(
 
     table = _ProbTable(n, vocab)
     ok = ~overflow
+    _SUPPORT_STATS.add(overflow_positions=int(overflow.sum()))
     if bool(ok.any()):
         probs = vals[ok].softmax(dim=-1, dtype=torch.float32)
         table.set_sparse(ok.nonzero().squeeze(1), idx[ok], probs)
@@ -1286,16 +1438,21 @@ def _walk_table(
     rows: int,
     num_drafts: int,
     vocab: int,
+    uniforms: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The point-mass walk over a built table (see ``_point_mass_walk``).
 
     Shared by the full-logits and the support entry points: only the table's
-    construction differs between them, and every draw happens here.
+    construction differs between them, and every draw happens here. With
+    ``uniforms`` (``predraw_uniforms``' table) the draws were made already:
+    none happens here and no generator advances.
     """
     width = num_drafts + 1
     valid = num_valid_drafts.to(torch.long)
     draft_ids = draft_token_ids.to(torch.long).clamp(0, vocab - 1)
     row_ids = torch.arange(rows)
+    if uniforms is not None:
+        return _walk_table_given(table, draft_token_ids, valid, draft_ids, uniforms, rows, num_drafts)
 
     # One batched draw for the unseeded rows: column 0 the bonus, column 1
     # the correction. Seeded rows overwrite their own entries below.
@@ -1346,6 +1503,51 @@ def _walk_table(
             exclude=draft_ids[corr_rows, pos],
         )
         candidates[corr_rows, pos] = recovered
+    candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
+    return accepted, candidates
+
+
+def _walk_table_given(
+    table: _ProbTable,
+    draft_token_ids: torch.Tensor,
+    valid: torch.Tensor,
+    draft_ids: torch.Tensor,
+    uniforms: torch.Tensor,
+    rows: int,
+    num_drafts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_walk_table`` on a given uniform table: the same arithmetic, no draws."""
+    width = num_drafts + 1
+    given = uniforms.to(torch.float64)
+    if tuple(given.shape) != (rows, num_drafts + 2):
+        raise ValueError(
+            f"uniforms must be [{rows}, {num_drafts + 2}], got {tuple(given.shape)}"
+        )
+    row_ids = torch.arange(rows)
+    bonus = table.sample(row_ids * width + valid, given[:, 0]).to(torch.int32)
+    accept_uniform = given[:, 1 : num_drafts + 1]
+    flat_ids = (row_ids.unsqueeze(1) * width + torch.arange(num_drafts)).reshape(-1)
+    p_draft = table.prob_of(flat_ids, draft_ids.reshape(-1)).reshape(rows, num_drafts)
+    accepted = (p_draft > 0) & (p_draft.to(torch.float64) >= accept_uniform)
+    in_row = torch.arange(num_drafts).unsqueeze(0) < valid.unsqueeze(1)
+    rejected = in_row & ~accepted
+    needs = rejected.any(dim=1)
+    first = rejected.to(torch.int8).argmax(dim=1)
+    candidates = torch.cat(
+        [
+            draft_token_ids.to(torch.int32),
+            torch.full((rows, 1), PLACEHOLDER_TOKEN_ID, dtype=torch.int32),
+        ],
+        dim=1,
+    )
+    corr_rows = needs.nonzero().squeeze(1)
+    if corr_rows.numel():
+        pos = first[corr_rows]
+        candidates[corr_rows, pos] = table.sample(
+            corr_rows * width + pos,
+            given[corr_rows, num_drafts + 1],
+            exclude=draft_ids[corr_rows, pos],
+        )
     candidates.scatter_(1, valid.unsqueeze(1), bonus.unsqueeze(1))
     return accepted, candidates
 

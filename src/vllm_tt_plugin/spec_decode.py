@@ -465,6 +465,15 @@ class VerifyOutput:
     # (no supports_async_spec_decode) guarantees. None when the model cannot
     # supply them, in which case an undecidable row is an error.
     fetch_logits: "Callable[[], torch.Tensor] | None" = None
+    # For a deferred "fused_sample" verify (``decode_forward(defer_read=True)``,
+    # chain mode): an opaque handle to a step whose result is still on the
+    # device. The step carries NO host tensors; the reader thread resolves the
+    # handle with ``model.read_decode_output(handle)`` (or ``handle.wait()``),
+    # which blocks on a device event and returns a ``FusedReadout``. The same
+    # handle is later passed to ``propose_draft_tokens`` as ``hidden`` on the
+    # engine thread. ``tip_id`` (an int attribute) names the step for
+    # ``chain_tip``.
+    handle: Any = None
 
     def __post_init__(self) -> None:
         required = MODE_REQUIRED_FIELDS.get(self.spec_mode)
@@ -473,12 +482,42 @@ class VerifyOutput:
                 f"VerifyOutput.spec_mode {self.spec_mode!r} is not one of "
                 f"{sorted(ACCEPT_MODES)}"
             )
+        if self.handle is not None:
+            if self.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                raise ValueError(
+                    "VerifyOutput.handle is only defined for spec_mode "
+                    f"{ACCEPT_MODE_FUSED_SAMPLE!r}, got {self.spec_mode!r}"
+                )
+            # The deferred form: ids and counts arrive with the handle's read,
+            # both or neither.
+            if (self.accepted_token_ids is None) != (self.accepted_counts is None):
+                raise ValueError(
+                    "a deferred fused_sample VerifyOutput carries both "
+                    "accepted_token_ids and accepted_counts or neither"
+                )
+            return
         missing = [name for name in required if getattr(self, name) is None]
         if missing:
             raise ValueError(
                 f"VerifyOutput for spec_mode {self.spec_mode!r} must carry "
                 f"{list(required)}, missing {missing}"
             )
+
+
+@dataclass(frozen=True)
+class FusedReadout:
+    """What reading a deferred fused verify's handle returns.
+
+    ``accepted_token_ids`` is ``[B, 1+K]`` int32 (placeholder past each row's
+    count), ``accepted_counts`` ``[B]`` int32 in ``[1, 1+K]``, and ``p0`` ``[B]``
+    int32: the ACTUAL position of each row's column 0, which differs from the
+    runner's provisional one for a chained row. A padding row reports a
+    negative ``p0``. A model may return a 3-tuple in this order instead.
+    """
+
+    accepted_token_ids: "torch.Tensor"
+    accepted_counts: "torch.Tensor"
+    p0: "torch.Tensor"
 
 
 def normalize_declared_values(
@@ -668,6 +707,7 @@ __all__ = [
     "SPEC_REQUIREMENT_HIDDEN_FEED",
     "SPEC_REQUIREMENT_PAGED_DRAFTER_CACHE",
     "DraftOutput",
+    "FusedReadout",
     "MODE_REQUIRED_FIELDS",
     "PLACEHOLDER_TOKEN_ID",
     "HiddenHandle",

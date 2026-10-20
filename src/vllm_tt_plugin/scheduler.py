@@ -40,6 +40,42 @@ logger = init_tt_logger(__name__)
 # prefix-cache reset made stale.
 _TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
 _TT_OUTPUT_FRAME_REQ_IDS_ATTR = "_tt_output_frame_req_ids"
+# Requests the base scheduler's running loop left out of a decode step only
+# because their in-flight step is sure to reach ``max_tokens``. Attached to the
+# SchedulerOutput like the attributes above; ``TTModelRunner`` reads it to tell
+# the model those slots are finishing.
+_TT_FINISHING_REQ_IDS_ATTR = "_tt_finishing_req_ids"
+# Per-request count of real drafts the runner verified, attached to the
+# ModelRunnerOutput by the async controller; read by ``update_from_output``.
+TT_VALID_DRAFTS_ATTR = "_tt_valid_drafts"
+_TT_SEED_REQ_IDS_ATTR = "_tt_seed_req_ids"
+
+
+def set_tt_finishing_req_ids(
+    scheduler_output: SchedulerOutput, req_ids: tuple[str, ...] | list[str]
+) -> None:
+    if req_ids:
+        setattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, tuple(req_ids))
+
+
+def get_tt_finishing_req_ids(scheduler_output: SchedulerOutput) -> tuple[str, ...]:
+    return tuple(getattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, ()))
+
+
+def request_will_reach_max_tokens(request: Request) -> bool:
+    """The vLLM 0.30 running-loop skip condition, verbatim.
+
+    ``vllm/v1/core/sched/scheduler.py:618-628``: an async step is already in
+    flight (``num_output_placeholders > 0``) and, even if every draft of it is
+    rejected, it commits the request's last allowed token. The base loop then
+    does not schedule the request again, though the scheduler has not seen the
+    output and the request is still in ``running``.
+    """
+    return (
+        request.num_output_placeholders > 0
+        and request.num_computed_tokens + 2 - request.num_output_placeholders
+        >= request.num_prompt_tokens + request.max_tokens
+    )
 
 
 def set_tt_forced_reset_discard_counts(
@@ -312,6 +348,11 @@ class TTScheduler(AsyncScheduler):
         # _mirror_spec_session). Only its owner can emit a block.
         self._spec_session_owner: str | None = None
         self._pending_async_output_frames: dict[str, int] = {}
+        # Requests that already had a speculative (placeholder-carrying) decode
+        # step scheduled since their last prefill. The first one is the seed
+        # step, which verifies no real draft (see update_from_output).
+        self._spec_step_seen: set[str] = set()
+        self._finishing_candidates: list[str] = []
         self._widest_decode_batch_size = 0
         self._prefill_chunk_alignment = (
             get_tt_prefill_chunk_alignment(self.vllm_config)
@@ -711,6 +752,19 @@ class TTScheduler(AsyncScheduler):
         return limit
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # Evaluated on the state the base running loop will see, before it
+        # mutates anything: the skip condition is a pure function of request
+        # state, and the loop advances ``num_computed_tokens`` of the requests
+        # it does schedule.
+        self._finishing_candidates = [
+            request.request_id
+            for request in self.running
+            if getattr(request, "num_output_placeholders", 0) > 0
+            and request_will_reach_max_tokens(request)
+        ]
+        return self._schedule_mode()
+
+    def _schedule_mode(self) -> SchedulerOutput:
         # NOTE: `throttle_prefills` accepted for interface compatibility with the base
         #        scheduler but unused - TT separates prefill/decode explicitly.
         has_pending_prefill = self._has_pending_prefill()
@@ -793,6 +847,25 @@ class TTScheduler(AsyncScheduler):
                     "TT scheduler: widest decode batch reached %d request row(s)",
                     rows,
                 )
+        if is_decode and self._finishing_candidates:
+            # A candidate counts only if this step really left it out and it
+            # is still a running request: not scheduled, and not preempted or
+            # finished by this very schedule (a preempted request resumes and
+            # is scheduled again, which a finishing slot must never be).
+            gone = set(scheduler_output.preempted_req_ids or ()) | set(
+                scheduler_output.finished_req_ids
+            )
+            finishing = tuple(
+                req_id
+                for req_id in self._finishing_candidates
+                if req_id not in scheduler_output.num_scheduled_tokens
+                and req_id not in gone
+                and req_id in self.requests
+                and self.requests[req_id].status == RequestStatus.RUNNING
+            )
+            if finishing:
+                setattr(scheduler_output, _TT_FINISHING_REQ_IDS_ATTR, finishing)
+        self._finishing_candidates = []
         pending_reset_discards = getattr(
             self, "_pending_forced_reset_discard_counts", {}
         )
@@ -929,6 +1002,7 @@ class TTScheduler(AsyncScheduler):
         # The parent computes whether this chunk produces output. Retain that
         # decision on this step because a later schedule changes the request.
         setattr(scheduler_output, _TT_OUTPUT_FRAME_REQ_IDS_ATTR, output_frame_req_ids)
+        self._track_spec_seed_steps(scheduler_output)
         pending = getattr(self, "_pending_async_output_frames", None)
         if pending is None:
             pending = self._pending_async_output_frames = {}
@@ -1091,6 +1165,64 @@ class TTScheduler(AsyncScheduler):
                 owner = None
         self._spec_session_owner = owner
 
+    def _track_spec_seed_steps(self, scheduler_output: SchedulerOutput) -> None:
+        """Record which requests this step carries their first draft offer for.
+
+        Under async scheduling every decode step reserves ``[-1] * K`` for each
+        scheduled request, but a request's first decode step after a prefill
+        (the seed step) has no proposal to verify. A prefill step carries no
+        offer, so a request scheduled without one starts over. Meaningful only
+        where the scheduler itself reserves placeholders (async scheduling).
+        """
+        if not (self.num_spec_tokens and self.scheduler_config.async_scheduling):
+            return
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        seen = self.__dict__.setdefault("_spec_step_seen", set())
+        seed: set[str] = set()
+        for req_id in scheduler_output.num_scheduled_tokens:
+            if offered.get(req_id):
+                if req_id not in seen:
+                    seen.add(req_id)
+                    seed.add(req_id)
+            else:
+                seen.discard(req_id)
+        setattr(scheduler_output, _TT_SEED_REQ_IDS_ATTR, frozenset(seed))
+        seen.difference_update(scheduler_output.finished_req_ids)
+
+    def _mark_unoffered_drafts_invalid(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Keep vLLM's speculative metrics from counting unverified placeholders.
+
+        ``AsyncScheduler`` offers K placeholders to every scheduled request, so
+        a step that verified fewer real drafts (the seed step: none) would
+        count the rest as rejected. vLLM subtracts
+        ``scheduler_output.num_invalid_spec_tokens[req_id]`` from the proposed
+        count (``scheduler.py:1990-2015``, ``make_spec_decoding_stats``). The
+        runner reports each row's real draft count on the output; without a
+        report the seed step is taken to verify none.
+        """
+        offered = scheduler_output.scheduled_spec_decode_tokens
+        if not offered:
+            return
+        valid = getattr(model_runner_output, TT_VALID_DRAFTS_ATTR, None) or {}
+        seed = getattr(scheduler_output, _TT_SEED_REQ_IDS_ATTR, frozenset())
+        invalid = dict(scheduler_output.num_invalid_spec_tokens or {})
+        for req_id, tokens in offered.items():
+            num_offered = len(tokens)
+            if req_id in valid:
+                extra = num_offered - int(valid[req_id])
+            elif req_id in seed:
+                extra = num_offered
+            else:
+                continue
+            extra = max(0, min(num_offered, extra))
+            if extra > invalid.get(req_id, 0):
+                invalid[req_id] = extra
+        scheduler_output.num_invalid_spec_tokens = invalid
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1100,6 +1232,7 @@ class TTScheduler(AsyncScheduler):
         its outputs, so ``_update_request_with_output`` reads the decision that
         produced THIS output rather than a later schedule's overwrite, and
         consume only the output frames this scheduled step reserved."""
+        self._mark_unoffered_drafts_invalid(scheduler_output, model_runner_output)
         if self._is_block_output_model:
             self._committing_block_step_decisions = get_tt_block_step_decisions(
                 scheduler_output

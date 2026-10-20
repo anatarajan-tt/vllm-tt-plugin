@@ -28,7 +28,7 @@ serve speculative decoding within the following execution limits:
   nothing.
 - two accept modes, **`argmax_ids`** and **`logits`**, chosen per step from
   what the model declares (section 4h). A plan must offer at least one of
-  them; `fused_sample` has no runner path. An ordinary narrow decode does not
+  them; `fused_sample` (stage S1) is an extra mode, never enough alone. An ordinary narrow decode does not
   send `spec_mode`. A model offering `logits` may also offer **`topk`**: the
   exact top-M candidates of every column instead of the full vocabulary, which
   the runner asks for, unless `VLLM_TT_SPEC_DEVICE_TOPK=0`, on a sampled step
@@ -86,7 +86,7 @@ exception does not raise: on a model that does not serve `logits` but declares
 and keep every step they are part of an ordinary decode, which uses the
 selected model's normal sampling path (section 4d). Separately, `TTPlatform`
 can disable async scheduling when `supports_async_decode` is absent (section
-4c). `fused_sample`, use of `DraftOutput.draft_scores` and a scheduler-owned
+4c). Use of `DraftOutput.draft_scores` and a scheduler-owned
 paged drafter cache each need their own execution path before the matching
 refusal can go.
 
@@ -223,12 +223,53 @@ model that can serve less returns a lower value and a model that can serve
 nothing returns `SpecReject`. `drafter_state` must not be `paged`, which needs
 a scheduler-owned drafter cache the plugin does not yet allocate.
 `accept_modes` must include `argmax_ids` or `logits`, the return formats the
-runner executes. A model may also declare `fused_sample`, but that declaration
-enables no execution path. Declaring `logits` enables sampled speculation for
+runner executes. A model may also declare `fused_sample` (stages S1 and S2, below).
+Declaring `logits` enables sampled speculation for
 every request admission lets through (section 4h); declaring both lets a greedy
 step keep the smaller `argmax_ids` readback. A non-empty `k_by_rows` must reach
 `max_num_seqs`: its last `max_rows` must be at least `max_num_seqs`, so that
 every live batch size the launch admits has a draft cap.
+
+**`fused_sample`, stage S1 (greedy rows only).** The runner asks for
+`fused_sample` on a step when the model offers it, `VLLM_TT_SPEC_FUSED` is not
+`0` (default `1`), and every live row is greedy-certifiable (the same test that
+gates `argmax_ids`); one other row sends the whole step to `topk` or `logits`
+as before, so a plan offering `fused_sample` must also offer `argmax_ids` or
+`logits`. The call is `decode_forward` exactly as for `argmax_ids`, with
+`spec_mode="fused_sample"`. The model returns `VerifyOutput` with
+`accepted_token_ids` `[B, 1+K]` int32 (`-1` past the count), `accepted_counts`
+`[B]` int32 in `[1, 1+K]`, and optionally `argmax_ids` for debugging, all as
+host tensors. A padding row returns count 1 and its column-0 argmax. The runner
+commits the fields as given, under `AcceptResult`'s rules, then calls
+`propose_draft_tokens` as for any other mode.
+
+**`fused_sample`, stage S2 (sampled rows).** The same mode also serves a step
+with sampled rows when the model offers `topk` too, `VLLM_TT_SPEC_FUSED_SAMPLED`
+is not `0` (default `1`), every row is greedy-certifiable or support-servable
+(the rule that gates `topk`, so `top_k` is in `[1, topk_candidates - 1]` on a
+sampled row), and no seeded row has zero valid drafts (that bonus is a
+full-vocabulary exponential race the device cannot run; such a step keeps
+`topk` / `logits`). The runner then adds the kwarg `spec_sampling` to
+`decode_forward`: a dict of host tensors over the PADDED rows `B` (width
+`1+K`): `temperature` fp32 `[B]` (0 = greedy), `top_k` int32 `[B]` (1 on a
+greedy row), `top_p` fp32 `[B]` (1.0 = off), `greedy` bool `[B]`, `uniforms`
+fp32 `[B, K+2]` (column 0 bonus, 1..K the accept draws of draft columns
+0..K-1, K+1 the correction; zero on padding rows). A greedy-only step sends no
+`spec_sampling`. The runner draws the uniforms before the call
+(`spec_accept.predraw_uniforms`), from each seeded row's own generator and the
+global stream, in the order `_walk_table` draws them, so a request's stream and
+the global stream end where the `topk` walk would leave them; the model draws
+nothing. The model accepts on its top-M support exactly as `accept_sampled_support`
+does with those uniforms (draft accepted when its probability is positive and at
+least its uniform; first rejection takes the correction from the distribution
+without the draft with the correction uniform; full acceptance takes the bonus
+with column 0; inverse CDF over the (value desc, id asc) support) and returns the
+same fields as S1. A position whose top-k tie group reaches the last candidate
+cannot be decided from the support: the model redoes that step itself from the
+full logits with the same uniforms. The runner's walk is unchanged: it reads
+`accepted_token_ids` and `accepted_counts`. Float32 rounding of the uniforms and
+of the device arithmetic can flip a decision only when a draft probability lies
+within about 1e-6 of its uniform.
 
 **`SpecReject.supported_k`** carries the draft lengths that would have worked at
 that concurrency, and the plugin quotes it to the operator. Populate it.
@@ -1118,6 +1159,50 @@ validation switch for a new device path, not a serving mode.
 **Not served.** Logprobs need the row's logsumexp and rank, and the
 penalties, grammar and token filters need the vocabulary: such rows keep the
 step in `logits` mode.
+
+## 4j. Chain mode: a fused verify submitted over the one in flight
+
+Opt-in, `VLLM_TT_SPEC_CHAIN=1` on the plugin (default `0`; off changes nothing)
+and `model_capabilities['supports_async_spec_decode']`, which a model declares
+only when it runs chain and fused. With async scheduling the runner then builds
+step n+1 without step n's committed tokens and submits it before step n is
+read; the device builds the real inputs from step n.
+
+A fused verify in this mode is called with `defer_read=True` (every fused step,
+chained or not) and returns `VerifyOutput(spec_mode="fused_sample",
+handle=<opaque>)` with no host tensors; the handle has an int `tip_id`. A step
+chained onto the pending one also carries:
+
+- `chain_rows`: bool `[B]`, the rows whose inputs the device builds. For them
+  `tokens` is `-1` in every column, `start_pos` holds optimistic provisional
+  positions (applied length plus `K+1` per verify in flight, minus 1, an upper
+  bound of the real position), and `accepted_counts` is `-1`. Other rows are
+  built from host state as ever (padding rows included).
+- `chain_tip`: the `tip_id` of the pending step. The model raises on mismatch.
+- `num_valid_drafts`: an upper bound for chain rows (the scheduler's
+  reservation, the plan's draft cap, and the room left under `max_model_len`
+  from the optimistic length). The model uses the smaller of it and its own
+  count. A seeded row chains only while the hint is the full count, because the
+  host draws that many uniforms from the row's generator.
+- `slot_remap`: as on any decode. Row `i` of a chained step reads the state of
+  slot `slot_remap[i]` (identity when absent), so a batch that condensed after a
+  request finished still maps to the right device state.
+
+The reader thread calls `model.read_decode_output(handle)` (or `handle.wait()`),
+which blocks on a device event and returns `FusedReadout(accepted_token_ids,
+accepted_counts, p0)` or that 3-tuple. `p0` is `[B]` int32, the actual position
+of each row's column 0; the committed-prefix length cap uses it, not the
+provisional position. `propose_draft_tokens(..., hidden=handle)` runs later on
+the engine thread, after the read, once per step, and returns `num_valid`; for
+a step whose drafts a chained step already consumed on the device the runner
+reads only `num_valid` and publishes a length hint, never ids.
+
+The runner chains only when exactly one verify is unresolved and it is the
+newest fused step; the scheduled requests are its rows less the finished ones;
+no prefill chunk, forced reset, grammar, logprobs, penalties or allowlist; every
+row fused-eligible; and `p0 + 2(K+1)` stays under `max_model_len`. Anything
+else drains first. A request finished at step n has already been scheduled into
+n+1: that output is discarded and the row is absent from n+2.
 
 ## 5. One request, from prefill to release
 

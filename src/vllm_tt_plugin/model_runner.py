@@ -33,6 +33,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 
+from vllm_tt_plugin.scheduler import get_tt_finishing_req_ids
 from vllm_tt_plugin.async_decode import (
     AsyncTTModelRunnerOutput,
     CompletedDecodeStep,
@@ -79,13 +80,20 @@ from vllm_tt_plugin.spec_accept import (
     SpecSamplingInputs,
     SpecTokenFilters,
     accept_sampled_drafts,
+    AcceptResult,
     accept_sampled_support,
     device_topk_enabled,
+    fused_sample_enabled,
+    fused_sampled_enabled,
     params_support_servable,
+    predraw_uniforms,
+    spec_chain_enabled,
+    spec_chain_sampled_enabled,
 )
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
     ACCEPT_MODE_ARGMAX_IDS,
+    ACCEPT_MODE_FUSED_SAMPLE,
     ACCEPT_MODE_LOGITS,
     ACCEPT_MODE_TOPK,
     PLACEHOLDER_TOKEN_ID,
@@ -253,6 +261,82 @@ def _penalty_prompt_ids(prompt_tokens: torch.Tensor, vocab_size: int) -> torch.T
     return ids.masked_fill(ids == -1, vocab_size)
 
 
+def _spec_row_params(
+    model_input: TTModelInput,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The live rows' ``(temperature, top_k, top_p)`` a walk samples under, copied.
+
+    A temperature below vLLM's sampler epsilon is a greedy row (0.0)."""
+    live = len(model_input.row_req_ids)
+    params = model_input.tt_sampling_params
+
+    def per_row(values: Any, dtype: torch.dtype) -> torch.Tensor:
+        tensor = torch.as_tensor(values, dtype=dtype).reshape(-1)
+        return (
+            tensor.expand(live).clone()
+            if tensor.numel() == 1
+            else tensor[:live].clone()
+        )
+
+    # vLLM's sampler samples a row below this temperature greedily, and the
+    # persistent batch keeps the raw value, so the walk is told the same.
+    temperature = per_row(params.temperature, torch.float32)
+    temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
+    return (
+        temperature,
+        per_row(params.top_k, torch.int32),
+        per_row(params.top_p, torch.float32),
+    )
+
+
+def fused_spec_sampling(
+    model_input: TTModelInput, plan: Any
+) -> dict[str, Any] | None:
+    """The ``spec_sampling`` kwarg of a ``fused_sample`` verify, or None for a greedy-only step.
+
+    Host tensors over the PADDED rows ``B`` of the block (width ``1+K``):
+    ``temperature`` fp32 [B] (0 = greedy), ``top_k`` int32 [B] (1 on a
+    greedy row, else 1..M-1), ``top_p`` fp32 [B] (1.0 = off), ``greedy``
+    bool [B], ``uniforms`` fp32 [B, K+2] (``predraw_uniforms``: column 0
+    bonus, 1..K accepts, K+1 correction; zero on padding rows).
+    The uniforms are drawn here, from the step's generators and the global
+    stream, in the order the host walk draws them, so the walk that
+    ``topk`` mode would have run leaves them where this leaves them."""
+    live = len(model_input.row_req_ids)
+    rows, width = (int(size) for size in model_input.input_tokens.shape)
+    temperature, top_k, top_p = _spec_row_params(model_input)
+    sampled = temperature > 0.0
+    if not bool(sampled.any()):
+        return None
+    limit = None if plan is None or plan.topk_candidates is None else int(plan.topk_candidates)
+    if limit is None or bool((sampled & ((top_k < 1) | (top_k > limit - 1))).any()):
+        raise RuntimeError(
+            "a fused_sample verify carries a sampled row whose top_k is outside "
+            f"[1, {limit and limit - 1}]; _spec_mode_for_step admits only support-servable rows"
+        )
+    generators = {
+        row: gen
+        for row, gen in model_input.generators_list[0].items()
+        if row < live
+    }
+    uniforms = predraw_uniforms(
+        generators, live, width - 1, model_input.num_valid_drafts[:live]
+    )
+
+    def padded(values: torch.Tensor, fill: Any, dtype: torch.dtype) -> torch.Tensor:
+        out = torch.full((rows, *values.shape[1:]), fill, dtype=dtype)
+        out[:live] = values
+        return out
+
+    return {
+        "temperature": padded(temperature, 0.0, torch.float32),
+        "top_k": padded(torch.where(sampled, top_k, torch.ones_like(top_k)), 1, torch.int32),
+        "top_p": padded(torch.where(sampled, top_p, torch.ones_like(top_p)), 1.0, torch.float32),
+        "greedy": padded(~sampled, True, torch.bool),
+        "uniforms": padded(uniforms, 0.0, torch.float32),
+    }
+
+
 def _spec_sampling_inputs(
     model_input: TTModelInput, vocab_size: int
 ) -> SpecSamplingInputs:
@@ -283,12 +367,7 @@ def _spec_sampling_inputs(
             else tensor[:live].clone()
         )
 
-    # vLLM's sampler samples a row below this temperature greedily, and the
-    # persistent batch keeps the raw value, so the walk is told the same.
-    temperature = per_row(params.temperature, torch.float32)
-    temperature = temperature.masked_fill(temperature < _SAMPLING_EPS, 0.0)
-    top_k = per_row(params.top_k, torch.int32)
-    top_p = per_row(params.top_p, torch.float32)
+    temperature, top_k, top_p = _spec_row_params(model_input)
 
     penalties = None
     if model_input.prompt_tokens is not None and model_input.output_tokens is not None:
@@ -601,6 +680,15 @@ class TTModelRunner:
         # consumes them in _drafts_to_verify within the scheduled lookahead
         # reservation. Each consumer takes a proposal only once.
         self._proposed_draft_token_ids: dict[str, list[int]] = {}
+        # Chain mode only (VLLM_TT_SPEC_CHAIN). ``_chain_len`` is a request's
+        # optimistic length at its newest chained build: the applied length plus
+        # K+1 per verify still in flight, an upper bound of the real one, so a
+        # provisional position never falls below the real position.
+        # ``_chain_consumed_tips`` holds the ids of fused steps whose drafts a
+        # later chained step already consumed on the device: their commit
+        # publishes a length hint, never the ids.
+        self._chain_len: dict[str, int] = {}
+        self._chain_consumed_tips: set[int] = set()
         # Asynchronous execution only. The drafts the latest verify submitted
         # for its structured-output rows, until take_draft_token_ids hands
         # them to the scheduler to validate against each grammar; then the ids
@@ -1396,6 +1484,40 @@ class TTModelRunner:
             slots.append(slot)
         return slots
 
+    def _claim_finishing_slots(
+        self, scheduler_output: SchedulerOutput, row_req_ids: list[str]
+    ) -> list[int] | None:
+        """Slots of requests this decode leaves out only because they finish.
+
+        ``TTScheduler`` names the running requests the base loop skipped since
+        their in-flight step is sure to reach ``max_tokens``. The model frees
+        their slots (``decode_forward(finishing_slots=...)``), so the runner
+        stops tracking them here: the slot is returned once, before the
+        remap, and never again for the request. The request is still in
+        ``self.requests`` until the scheduler reports it finished, and
+        ``_release_model_request`` then finds no slot and releases nothing,
+        which is right: the model released it already. Only for a model that
+        declares ``supports_finishing_slots``; else the request stays held and
+        the model parks it as before.
+        """
+        finishing = get_tt_finishing_req_ids(scheduler_output)
+        if not finishing:
+            return None
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        if not capabilities.get("supports_finishing_slots", False):
+            return None
+        rows = set(row_req_ids)
+        slots: list[int] = []
+        for req_id in finishing:
+            if req_id in rows:
+                raise RuntimeError(
+                    f"request {req_id!r} is both scheduled and finishing"
+                )
+            slot = self._req_state_slot.pop(req_id, None)
+            if slot is not None:
+                slots.append(slot)
+        return slots or None
+
     def _decode_state_slot_remap(self, row_req_ids: list[str]) -> torch.Tensor | None:
         """Gather permutation taking each request's state to its decode row: row
         ``i`` reads slot ``remap[i]``. Always full slot width (no OOB gather); None
@@ -1508,6 +1630,7 @@ class TTModelRunner:
         self,
         scheduler_output: SchedulerOutput,
         row_req_ids: list[str],
+        chain_hints: dict[str, int] | None = None,
     ) -> dict[str, list[int]]:
         """The drafts this step verifies, by request.
 
@@ -1531,12 +1654,25 @@ class TTModelRunner:
         path gets from ``take_draft_token_ids``: a proposal is handed over
         once, so a row that proposed nothing this step verifies nothing next
         step rather than replaying a spent proposal.
+
+        ``chain_hints`` (chain mode, ``_chain_build_plan``) maps each chained
+        request to how many drafts the step may carry. Those drafts never
+        reach the host: the device built them from the pending verify. Such a
+        row gets that many placeholders, which only say how long the block is,
+        and whatever proposal is stored for it is dropped unread: it is a
+        hint of an older step or ids the device already consumed, and replaying
+        either would verify a stale block.
         """
         scheduled = scheduler_output.scheduled_spec_decode_tokens
         if not self.async_decode_scheduling:
             return scheduled
         drafts: dict[str, list[int]] = {}
         for req_id in row_req_ids:
+            if chain_hints is not None:
+                self._proposed_draft_token_ids.pop(req_id, None)
+                if chain_hints.get(req_id, 0) > 0:
+                    drafts[req_id] = [PLACEHOLDER_TOKEN_ID] * chain_hints[req_id]
+                continue
             offered = list(scheduled.get(req_id) or ())
             placeholders = sum(1 for token in offered if token == PLACEHOLDER_TOKEN_ID)
             if placeholders and placeholders != len(offered):
@@ -1554,9 +1690,119 @@ class TTModelRunner:
                 self._proposed_draft_token_ids.pop(req_id, None)
                 continue
             proposed = self._proposed_draft_token_ids.pop(req_id, None)
+            if proposed and PLACEHOLDER_TOKEN_ID in proposed:
+                # A length hint of a chained commit (``_publish_draft``), not
+                # ids: the drafts it described were consumed on the device.
+                # Verifying it would put placeholders in a row's valid prefix.
+                proposed = None
             if proposed:
                 drafts[req_id] = list(proposed[:placeholders])
         return drafts
+
+    def _chain_rows_blocker(
+        self,
+        req_ids: list[str],
+        scheduler_output: SchedulerOutput,
+        inflight: int,
+    ) -> tuple[str | None, tuple[dict[str, int], dict[str, int]] | None]:
+        """Whether every request in ``req_ids`` can ride a chained fused verify.
+
+        Returns ``(reason, None)`` for the first thing that forbids it, else
+        ``(None, (chain_len, hints))``: each request's optimistic length (the
+        applied length plus K+1 per in-flight verify, an upper bound of the
+        real length) and how many drafts its block may carry. A hint is the
+        smallest of the scheduler's reservation, the plan's draft cap and the
+        room left under ``max_model_len`` from the optimistic length. The
+        optimistic length only ever shrinks a hint: the real length is at most
+        it, so the real room is at least the hint's.
+
+        A seeded request's draws depend on its draft count (``predraw_uniforms``
+        draws that many accepts from its own generator), so it chains only
+        while the hint equals the full count the device will also use.
+        """
+        num_drafts = self._num_speculative_tokens
+        width = num_drafts + 1
+        batch = self.input_batch
+        if not batch.no_penalties:
+            return "penalties", None
+        if not batch.no_allowed_token_ids:
+            return "allowed_token_ids", None
+        if batch.sampling.bad_words_token_ids:
+            return "bad_words", None
+        if batch.max_num_logprobs is not None:
+            return "logprobs", None
+        if batch.sampling.has_active_logitsprocs():
+            return "logitsprocs", None
+        if scheduler_output.pending_structured_output_tokens or has_structured_outputs(
+            self.requests, scheduler_output, None
+        ):
+            return "grammar", None
+        max_model_len = int(self.model_config.max_model_len)
+        plan = getattr(self, "_spec_plan", None)
+        order = sorted(req_ids, key=lambda r: batch.req_id_to_index.get(r, 0))
+        draft_cap = plan.draft_cap(len(order)) if plan is not None else num_drafts
+        scheduled = scheduler_output.scheduled_spec_decode_tokens
+        generators = getattr(getattr(batch, "sampling", None), "generators", None) or {}
+        chain_len: dict[str, int] = {}
+        hints: dict[str, int] = {}
+        for req_id in order:
+            row = batch.req_id_to_index.get(req_id)
+            if row is None or req_id not in self.requests:
+                return "layout", None
+            offered = list(scheduled.get(req_id) or ())
+            if any(token != PLACEHOLDER_TOKEN_ID for token in offered):
+                return "real_drafts", None
+            length = int(batch.num_tokens[row]) + width * inflight
+            if length - 1 + 2 * width > max_model_len:
+                return "max_len", None
+            hint = max(0, min(len(offered), draft_cap, max_model_len - length))
+            if row in generators and hint != min(num_drafts, draft_cap):
+                return "seeded_short", None
+            chain_len[req_id] = length
+            hints[req_id] = hint
+        if not all(self._request_is_speculable(req_id) for req_id in order):
+            return "not_speculable", None
+        num_valid = torch.tensor([hints[r] for r in order], dtype=torch.int32)
+        if self._spec_mode_for_step(order, num_valid) != ACCEPT_MODE_FUSED_SAMPLE:
+            return "not_fused", None
+        if not spec_chain_sampled_enabled() and not all(
+            self._request_is_argmax_certifiable(r) for r in req_ids
+        ):
+            # A sampled row runs the synchronous S2 step (host overflow redo).
+            return "sampled", None
+        if self._spec_supports_narrow_decode and not any(hints.values()):
+            return "no_drafts", None
+        return None, (chain_len, hints)
+
+    def _chain_build_plan(
+        self, scheduler_output: SchedulerOutput, row_req_ids: list[str]
+    ) -> Any:
+        """The ``ChainPlan`` this decode build chains with, or None to build as ever.
+
+        Asked by ``_prepare_model_inputs`` after the lifecycle update and the
+        apply of every completed step, so the controller sees the batch this
+        step will be built from. A plan whose requests are not exactly the
+        build's rows is refused loudly: the drain decision was made on the
+        same scheduler output, and the two disagreeing means a verify is about
+        to be built over a step that is still in flight.
+        """
+        controller = getattr(self, "async_decode", None)
+        if controller is None:
+            return None
+        reason, plan = controller.chain_evaluate(scheduler_output)
+        if reason == "no_pending":
+            # The step that made the pre-build decision chain-eligible has
+            # resolved since. Its commit is not applied yet, so a host-staged
+            # build now would start one token behind.
+            controller.apply_resolved_before_build(scheduler_output)
+        if plan is None:
+            return None
+        if set(plan.chain_len) != set(row_req_ids):
+            raise RuntimeError(
+                "the chain plan's requests "
+                f"{sorted(plan.chain_len)} are not the build's rows {row_req_ids}"
+            )
+        return plan
 
     @staticmethod
     def _spec_row_state(
@@ -1653,7 +1899,9 @@ class TTModelRunner:
             return True
         return self._request_is_argmax_certifiable(req_id)
 
-    def _spec_mode_for_step(self, row_req_ids: list[str]) -> str:
+    def _spec_mode_for_step(
+        self, row_req_ids: list[str], num_valid_drafts: Any = None
+    ) -> str:
         """The accept mode one verify asks for, from the rows it carries.
 
         ``argmax_ids`` while every row is certifiable by id equality
@@ -1667,23 +1915,55 @@ class TTModelRunner:
         ``[B, 1+K, M]`` candidates and commits what ``logits`` would.
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
-        if ACCEPT_MODE_LOGITS not in modes:
-            return ACCEPT_MODE_ARGMAX_IDS
-        if ACCEPT_MODE_ARGMAX_IDS not in modes:
-            return ACCEPT_MODE_LOGITS
         certifiable = [self._request_is_argmax_certifiable(r) for r in row_req_ids]
-        if all(certifiable):
-            return ACCEPT_MODE_ARGMAX_IDS
-        if (
+        support_ok = (
             ACCEPT_MODE_TOPK in modes
             and device_topk_enabled()
             and all(
                 ok or self._request_is_support_servable(req_id)
                 for ok, req_id in zip(certifiable, row_req_ids)
             )
-        ):
+        )
+        if ACCEPT_MODE_FUSED_SAMPLE in modes and fused_sample_enabled():
+            if all(certifiable):
+                # Stage S1: greedy rows only. The device accepts and commits,
+                # and the runner reads back ids and counts.
+                return ACCEPT_MODE_FUSED_SAMPLE
+            if (
+                # Stage S2: sampled rows on the same support rule as ``topk``.
+                # The runner draws the uniforms (``fused_spec_sampling``); a
+                # seeded row with no draft needs the full-vocabulary race.
+                fused_sampled_enabled()
+                and support_ok
+                and not self._seeded_row_without_drafts(row_req_ids, num_valid_drafts)
+            ):
+                return ACCEPT_MODE_FUSED_SAMPLE
+        if ACCEPT_MODE_LOGITS not in modes:
+            return ACCEPT_MODE_ARGMAX_IDS
+        if ACCEPT_MODE_ARGMAX_IDS not in modes:
+            return ACCEPT_MODE_LOGITS
+        if all(certifiable):
+            return ACCEPT_MODE_ARGMAX_IDS
+        if support_ok:
             return ACCEPT_MODE_TOPK
         return ACCEPT_MODE_LOGITS
+
+    def _seeded_row_without_drafts(
+        self, row_req_ids: list[str], num_valid_drafts: Any
+    ) -> bool:
+        """True when a seeded row carries no valid draft (or the counts are unknown).
+
+        Its bonus is a full-vocabulary exponential race from its own generator,
+        which the device cannot run, so the step keeps the host walk."""
+        batch = self.input_batch
+        generators = getattr(getattr(batch, "sampling", None), "generators", None) or {}
+        index = getattr(batch, "req_id_to_index", {})
+        for row, req_id in enumerate(row_req_ids):
+            if index.get(req_id) in generators and (
+                num_valid_drafts is None or int(num_valid_drafts[row]) == 0
+            ):
+                return True
+        return False
 
     def _request_is_support_servable(self, req_id: str) -> bool:
         """True when a ``topk`` verify's candidates can sample this request.
@@ -1848,6 +2128,8 @@ class TTModelRunner:
         row_req_ids: list[str],
         *,
         skip_req_ids: set[str] | None = None,
+        first_positions: torch.Tensor | None = None,
+        chain_consumed: bool = False,
     ) -> None:
         """Ask the model's own drafter for the next step's drafts.
 
@@ -1862,6 +2144,13 @@ class TTModelRunner:
         does not interpret it, and a drafter that needs none is handed whatever
         its verify returned, which for a model that returns nothing is
         ``None``.
+
+        ``first_positions`` is the device-reported position of each row's
+        column 0 (chain mode), which replaces the submitted one: a chained
+        step's submitted positions are only provisional. ``chain_consumed``
+        says a later chained step already took this step's drafts on the
+        device, so the ids are not the host's to replay: only each row's count
+        is read, and a length hint is published in their place.
         """
         num_drafts = self._num_speculative_tokens
         width = num_drafts + 1
@@ -1894,7 +2183,13 @@ class TTModelRunner:
         else:
             # A verify has authoritative submitted positions. Its physical
             # acceptance count can exceed the prefix retained at max_model_len.
-            positions = self._committed_positions(model_input.input_positions, width)
+            # A chained one reports its own on the readback.
+            positions = self._committed_positions(
+                model_input.input_positions
+                if first_positions is None
+                else first_positions,
+                width,
+            )
         drafted = self.model.propose_draft_tokens(
             num_drafts,
             committed,
@@ -1956,7 +2251,10 @@ class TTModelRunner:
         # tail is never read, so a drafter may pad it with the placeholder or
         # with anything else.
         vocab = int(self.input_batch.vocab_size)
-        if offered is None:
+        if chain_consumed:
+            # The ids are not read: they stay on the device.
+            out_of_range = torch.zeros_like(draft_token_ids, dtype=torch.bool)
+        elif offered is None:
             out_of_range = (draft_token_ids < 0) | (draft_token_ids >= vocab)
         else:
             columns = torch.arange(num_drafts).unsqueeze(0)
@@ -2007,6 +2305,12 @@ class TTModelRunner:
             room = max_model_len - int(self.input_batch.num_tokens[batch_row])
             row_offered = num_drafts if offered is None else int(offered[row])
             usable = max(0, min(row_offered, room))
+            if chain_consumed:
+                # Only the length: the drafts this describes went to the next
+                # verify on the device, and replaying their ids would verify a
+                # block that step already consumed.
+                self._publish_draft(req_id, [PLACEHOLDER_TOKEN_ID] * usable)
+                continue
             self._publish_draft(
                 req_id, [int(token) for token in draft_token_ids[row, :usable]]
             )
@@ -2233,6 +2537,8 @@ class TTModelRunner:
         accepted_counts: torch.Tensor | None = None
         spec_drafts: torch.Tensor | None = None
         spec_mode: str | None = None
+        chain: Any = None
+        chain_rows: torch.Tensor | None = None
         if is_prompt:
             # num_computed_tokens for each request is the input position
             # (=computed previously and cached)
@@ -2280,7 +2586,20 @@ class TTModelRunner:
                 for req_id in row_req_ids:
                     self._req_accepted_counts.pop(req_id, None)
         else:
+            chain = None
+            if self._num_speculative_tokens and spec_chain_enabled():
+                # May apply a step that resolved since the pre-build apply, so
+                # the lengths are read after it.
+                chain = self._chain_build_plan(scheduler_output, row_req_ids)
             positions_np = input_batch.num_tokens[req_indices] - 1
+            if chain is not None:
+                # Chain mode: the pending verify's commit is not applied, so
+                # the persistent batch is one step behind. Positions are the
+                # optimistic upper bound; the device reports the real ones.
+                positions_np = np.array(
+                    [chain.chain_len[req_id] - 1 for req_id in row_req_ids],
+                    dtype=positions_np.dtype,
+                )
             input_positions = torch.from_numpy(positions_np)
             input_tokens = input_batch.token_ids_cpu_tensor[
                 req_indices, positions_np
@@ -2295,7 +2614,11 @@ class TTModelRunner:
                 spec_plan = getattr(self, "_spec_plan", None)
                 spec_drafts, num_valid_drafts, accepted_counts = self._spec_row_state(
                     self._req_accepted_counts,
-                    self._drafts_to_verify(scheduler_output, row_req_ids),
+                    self._drafts_to_verify(
+                        scheduler_output,
+                        row_req_ids,
+                        None if chain is None else chain.hints,
+                    ),
                     row_req_ids,
                     self._num_speculative_tokens,
                     (
@@ -2311,11 +2634,40 @@ class TTModelRunner:
                     accepted_counts,
                     len(row_req_ids),
                 ):
-                    spec_mode = self._spec_mode_for_step(row_req_ids)
+                    spec_mode = self._spec_mode_for_step(
+                        row_req_ids, num_valid_drafts
+                    )
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
                         spec_drafts, num_valid_drafts, input_tokens, input_positions
+                    )
+                    if chain is not None:
+                        if spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+                            raise RuntimeError(
+                                "a chained step must be a fused_sample verify, "
+                                f"the build resolved {spec_mode!r}"
+                            )
+                        # Placeholders in every column: the device builds the
+                        # block from the pending step. The count is the
+                        # model's own to resolve (-1), not the stale one.
+                        input_tokens = torch.full_like(
+                            input_tokens, PLACEHOLDER_TOKEN_ID
+                        )
+                        accepted_counts = torch.full_like(
+                            accepted_counts, PLACEHOLDER_TOKEN_ID
+                        )
+                        chain_rows = torch.ones(len(row_req_ids), dtype=torch.bool)
+                        self.__dict__.setdefault("_chain_len", {}).update(
+                            chain.chain_len
+                        )
+                        self.__dict__.setdefault("_chain_consumed_tips", set()).add(
+                            chain.tip
+                        )
+                elif chain is not None:
+                    raise RuntimeError(
+                        "a chained build resolved no verify; _chain_rows_blocker "
+                        "admits only steps that verify"
                     )
                 else:
                     # Either this step has nothing to verify, or a row that is
@@ -2380,6 +2732,10 @@ class TTModelRunner:
                 if num_valid_drafts is not None:
                     num_valid_drafts = torch.cat(
                         [num_valid_drafts, torch.zeros(batch_pad, dtype=torch.int32)]
+                    )
+                if chain_rows is not None:
+                    chain_rows = torch.cat(
+                        [chain_rows, torch.zeros(batch_pad, dtype=torch.bool)]
                     )
                 if accepted_counts is not None:
                     # A padding row carries no draft and stands on its own
@@ -2492,7 +2848,14 @@ class TTModelRunner:
             # which an intermediate chunk must not do. Host sampling can hand
             # those rows a generator clone instead.
             perform_device_sampling = False
-        if spec_mode in (ACCEPT_MODE_LOGITS, ACCEPT_MODE_TOPK):
+        # ``fused_sample`` needs no host logits either: it reads like
+        # ``argmax_ids``, so a greedy-only step falls through with whatever the
+        # check decided. A step with a sampled row (stage S2) takes its uniforms
+        # from the rows' own generators, as the host walks do.
+        if spec_mode in (ACCEPT_MODE_LOGITS, ACCEPT_MODE_TOPK) or (
+            spec_mode == ACCEPT_MODE_FUSED_SAMPLE
+            and not all(self._request_is_argmax_certifiable(r) for r in row_req_ids)
+        ):
             # The host walk samples from the logits (or the top-k support)
             # this verify returns, so the model must not sample on device, and
             # the rows' generators have to be the requests' own.
@@ -2591,12 +2954,17 @@ class TTModelRunner:
         input_batch.reset_slot_remap()
         prefill_empty_slots = None
         slot_remap = None
+        finishing_slots = None
         if is_prompt:
             prefill_empty_slots = self._alloc_prefill_state_slots(row_req_ids)
         else:
             # Advances the ownership map to the post-gather layout, so the returned
             # remap has to reach the device: dropping it would leave the map claiming
             # a move that never happened.
+            # Called unbound: runner doubles in the host tests are namespaces.
+            finishing_slots = TTModelRunner._claim_finishing_slots(
+                self, scheduler_output, row_req_ids
+            )
             slot_remap = self._decode_state_slot_remap(row_req_ids)
 
         grammar_rows_per_request = None
@@ -2636,6 +3004,7 @@ class TTModelRunner:
             output_tokens=output_tokens,
             decode_layout_changed=decode_layout_changed,
             slot_remap=slot_remap,
+            finishing_slots=finishing_slots,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[bad_words_token_ids],
@@ -2660,6 +3029,8 @@ class TTModelRunner:
             spec_mode=spec_mode if spec_drafts is not None else None,
             grammar_rows_per_request=grammar_rows_per_request,
             spec_min_tokens=spec_min_tokens,
+            chain_rows=chain_rows,
+            chain_tip=None if chain is None else chain.tip,
         )
 
     def _structured_drafts(
@@ -2725,6 +3096,14 @@ class TTModelRunner:
         if (
             self.async_decode.decode_input_update_contract_version() < 1
             and self._decode_layout_changed_since_last_decode
+            # A chained verify keeps its overlap across a layout change (a
+            # request finished and the batch condensed): the model that
+            # declares ``supports_async_spec_decode`` follows its rows through
+            # the slot remap, and it owns no reset_batch for a verify.
+            and (
+                not spec_chain_enabled()
+                or self.async_decode.chain_blocker(scheduler_output) is not None
+            )
         ):
             # Preserve the legacy path's drain point: version-0 adapters still
             # own reload policy and receive reset_batch after batch mutation.
@@ -3025,6 +3404,10 @@ class TTModelRunner:
         steady_decode_candidate = (
             self.async_decode.can_attempt_steady_decode_from_scheduler(scheduler_output)
         )
+        # Chain mode: before anything may drain, remember who finished, so the
+        # late output of a verify already in flight for them is discarded.
+        if spec_chain_enabled():
+            self.async_decode.note_finished_requests(scheduler_output.finished_req_ids)
         if self.async_decode.must_drain_pending_async_steps(
             steady_decode_candidate, scheduler_output
         ):
@@ -3253,6 +3636,8 @@ class TTModelRunner:
             return self._walk_sampled_acceptance(model_input, tt_out)
         if model_input.spec_mode == ACCEPT_MODE_TOPK:
             return self._walk_support_acceptance(model_input, tt_out)
+        if model_input.spec_mode == ACCEPT_MODE_FUSED_SAMPLE:
+            return self._walk_fused_acceptance(model_input, tt_out)
         if model_input.spec_mode != ACCEPT_MODE_ARGMAX_IDS:
             raise NotImplementedError(
                 f"the runner drives no accept walk for spec_mode "
@@ -3287,6 +3672,62 @@ class TTModelRunner:
                 model_input.num_valid_drafts,
             )
         )
+
+    def _walk_fused_acceptance(self, model_input: TTModelInput, out: Any) -> SpecWalk:
+        """Take one ``fused_sample`` verify's committed ids and counts as given.
+
+        The device already accepted, so there is no walk: the two fields are
+        checked against the submitted rows and ``AcceptResult``'s rules (count
+        in ``[1, width]``, ``PLACEHOLDER_TOKEN_ID`` exactly past the count) and
+        passed on. A padding row comes back with count 1 and its column-0
+        argmax, as the ``argmax_ids`` walk commits it. Sampled rows (stage S2)
+        were accepted on the device from the uniforms ``fused_spec_sampling``
+        drew; neither stage serves logprobs.
+        """
+        if not isinstance(out, VerifyOutput) or out.spec_mode != ACCEPT_MODE_FUSED_SAMPLE:
+            raise TypeError(
+                "a verify in fused_sample mode must reach the walk as its "
+                f"VerifyOutput, got {type(out).__name__}"
+            )
+        if model_input.max_num_logprobs[0] is not None:
+            raise RuntimeError(
+                "a fused_sample verify carries a row that asked for logprobs, "
+                "which it cannot answer; _spec_mode_for_step asks for fused_sample "
+                "only when every row is greedy-certifiable"
+            )
+        rows, max_width = (int(size) for size in model_input.input_tokens.shape)
+        committed, counts = out.accepted_token_ids, out.accepted_counts
+        for name, tensor in (
+            ("accepted_token_ids", committed),
+            ("accepted_counts", counts),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"a fused_sample verify must return {name} as a host tensor, "
+                    f"got {type(tensor).__name__}"
+                )
+            if tensor.dtype != torch.int32:
+                raise ValueError(
+                    f"a fused_sample verify must return {name} as int32, "
+                    f"got {tensor.dtype}"
+                )
+        if (
+            committed.dim() != 2
+            or int(committed.shape[0]) != rows
+            or not 1 <= int(committed.shape[1]) <= max_width
+        ):
+            raise ValueError(
+                "a fused_sample verify must return accepted_token_ids of shape "
+                f"[{rows}, 1+K'] with 1+K' at most {max_width}: every submitted "
+                f"row. Got {tuple(committed.shape)}"
+            )
+        if tuple(counts.shape) != (rows,):
+            raise ValueError(
+                f"a fused_sample verify must return accepted_counts of shape "
+                f"({rows},), got {tuple(counts.shape)}"
+            )
+        result = AcceptResult(committed, counts)
+        return SpecWalk(result.committed_token_ids, result.accepted_counts, None)
 
     def _walk_sampled_acceptance(
         self, model_input: TTModelInput, logits: Any
@@ -3430,6 +3871,7 @@ class TTModelRunner:
         model_input: TTModelInput,
         committed: torch.Tensor,
         counts: torch.Tensor,
+        first_positions: torch.Tensor | None = None,
     ) -> list[list[int]]:
         """Each live row's accepted prefix, as the step's published output.
 
@@ -3443,10 +3885,16 @@ class TTModelRunner:
         still the row's length when the commit runs. Publishing more than fits
         would report tokens the commit then refuses to write, and the request's
         own history and the engine's would disagree about its text.
+
+        ``first_positions`` is each row's device-reported column-0 position. A
+        chained step's submitted positions are only an optimistic bound, so the
+        cap must use the reported ones.
         """
         rows = len(model_input.row_req_ids)
         max_model_len = int(self.model_config.max_model_len)
-        positions = model_input.input_positions
+        positions = (
+            model_input.input_positions if first_positions is None else first_positions
+        )
         first = positions if positions.dim() == 1 else positions[:, 0]
         block = committed[:rows].tolist()
         prefixes: list[list[int]] = []
@@ -3466,6 +3914,7 @@ class TTModelRunner:
         spec_hidden: Any,
         *,
         skip_req_ids: set[str] | None = None,
+        first_positions: torch.Tensor | None = None,
     ) -> dict[str, list[int]]:
         """Apply the accepted prefixes and publish the next proposal.
 
@@ -3473,6 +3922,11 @@ class TTModelRunner:
         synchronous path inside the sampling tail, and on the asynchronous path
         when the next step drains this one. ``skip_req_ids`` is how a forced
         prefix-cache reset drops a frame it has already accounted for.
+
+        Chain mode: the applied length replaces the optimistic ``_chain_len``,
+        and a step whose drafts a later chained step already consumed on the
+        device (``_chain_consumed_tips``) publishes only a length hint.
+        ``first_positions`` carries the device-reported column-0 positions.
         """
         row_req_ids = model_input.row_req_ids
         rows = len(row_req_ids)
@@ -3482,6 +3936,23 @@ class TTModelRunner:
             counts[:rows],
             skip_req_ids=skip_req_ids,
         )
+        # Read off ``__dict__``: the books exist only once a chain was built,
+        # and a launch with chaining off never touches them.
+        chain_consumed = False
+        consumed_tips = self.__dict__.get("_chain_consumed_tips")
+        tip = getattr(spec_hidden, "tip_id", None)
+        if consumed_tips and tip is not None and tip in consumed_tips:
+            consumed_tips.discard(tip)
+            chain_consumed = True
+        if first_positions is not None:
+            # A padding row owns no request: whatever the device reports there,
+            # the drafter must see the "no position" marker.
+            first_positions = first_positions.clone()
+            first_positions[rows:] = -1
+        chain_len = self.__dict__.get("_chain_len")
+        if chain_len:
+            for req_id in row_req_ids:
+                chain_len.pop(req_id, None)
         if getattr(self, "_spec_drafts_from_model", False):
             self._propose_model_drafts(
                 committed,
@@ -3490,6 +3961,8 @@ class TTModelRunner:
                 spec_hidden,
                 row_req_ids,
                 skip_req_ids=skip_req_ids,
+                first_positions=first_positions,
+                chain_consumed=chain_consumed,
             )
         else:
             self._propose_ngram_drafts(committed_by_req)

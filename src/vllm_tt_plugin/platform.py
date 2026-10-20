@@ -2347,6 +2347,22 @@ class TTPlatform(Platform):
             # The TT bootstrap patch admits custom_class through upstream's
             # method check. These capability checks determine whether the
             # selected model can serve the combined async speculative path.
+            from vllm_tt_plugin.spec_accept import spec_chain_enabled
+
+            if not spec_chain_enabled():
+                # Admitted, and correct, but without chaining each verify still
+                # waits for the previous one's commit: async scheduling then
+                # overlaps nothing for a speculating launch. Chaining needs a
+                # model that runs chain and fused (which is what its
+                # supports_async_spec_decode declares) and VLLM_TT_SPEC_CHAIN=1.
+                logger.warning(
+                    "Async scheduling is on with speculative decoding for TT "
+                    "model %s, but VLLM_TT_SPEC_CHAIN is not set: every verify "
+                    "will drain the previous one and async scheduling gains "
+                    "nothing. Set VLLM_TT_SPEC_CHAIN=1 with a model that "
+                    "chains fused verifies, or launch with --no-async-scheduling.",
+                    model_class.__name__,
+                )
 
         if vllm_config.speculative_config and uses_tt_lane_coordinator(vllm_config):
             raise ValueError(
