@@ -24,6 +24,7 @@ from vllm_tt_plugin.config import (
     TT_SCHEDULER_CLS,
     TT_WORKER_CLS,
     get_tt_supports_stage_inputs,
+    get_tt_supports_stage_outputs,
     resolve_tt_scheduler_cls,
 )
 from vllm_tt_plugin.platform import TTPlatform
@@ -58,6 +59,20 @@ class TTStageGenerationScheduler(OmniGenerationScheduler):
 
 class TTStageARWorker(TTWorker):
     tt_scheduler_cls = TTStageARScheduler
+
+
+class TTRefusingStageARScheduler(TTStageARScheduler):
+    seen: list = []
+
+    @classmethod
+    def validate_tt_config(cls, vllm_config) -> None:
+        cls.seen.append(vllm_config.scheduler_config.scheduler_cls)
+        if vllm_config.scheduler_config.max_num_seqs != 1:
+            raise ValueError("this stage runs one sequence")
+
+
+class TTRefusingStageARWorker(TTWorker):
+    tt_scheduler_cls = TTRefusingStageARScheduler
 
 
 class TTStageGenerationWorker(TTWorker):
@@ -210,6 +225,32 @@ class TestDPModes:
         dummy_model_class.model_capabilities = {"supports_stage_inputs": True}
 
         with pytest.raises(ValueError, match="lane mode does not pass stage inputs"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+    def test_check_and_update_config_stores_stage_output_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+        vllm_config.scheduler_config.max_num_seqs = 1
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert get_tt_supports_stage_outputs(vllm_config) is True
+
+    def test_check_and_update_config_refuses_stage_outputs_in_lane_mode(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        vllm_config.additional_config = {"_tt_resolved_lane_count": 2}
+        vllm_config.parallel_config.data_parallel_size = 1
+        dummy_model_class.model_capabilities = {"supports_stage_outputs": True}
+
+        with pytest.raises(ValueError, match="needs one-token front-packed"):
             self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_collapsed_standard_dp_rank_warms_up_model(self) -> None:
@@ -647,6 +688,25 @@ class TestDPModes:
         # TTWorker.init_device re-applies the hook in the worker process.
         self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
         assert vllm_config.scheduler_config.scheduler_cls == expected
+
+    def test_the_paired_scheduler_validates_the_resolved_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        vllm_config: SimpleNamespace,
+        dummy_model_class: type,
+    ) -> None:
+        monkeypatch.setattr(TTRefusingStageARScheduler, "seen", [])
+        vllm_config.scheduler_config.scheduler_cls = OmniARAsyncScheduler
+        vllm_config.parallel_config.worker_cls = TTRefusingStageARWorker
+        vllm_config.scheduler_config.max_num_seqs = 1
+
+        self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
+
+        assert TTRefusingStageARScheduler.seen == [TTRefusingStageARScheduler]
+
+        vllm_config.scheduler_config.max_num_seqs = 2
+        with pytest.raises(ValueError, match="this stage runs one sequence"):
+            self.register_dummy_model(monkeypatch, vllm_config, dummy_model_class)
 
     def test_check_and_update_config_rejects_a_mismatched_pair(
         self,

@@ -29,6 +29,7 @@ from vllm_tt_plugin.config import (
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
     resolve_tt_scheduler_cls,
+    resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
@@ -36,9 +37,11 @@ from vllm_tt_plugin.config import (
     store_tt_output_tokens_per_step,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
+    tt_requests_cannot_resume,
     uses_tt_lane_coordinator,
     validate_and_store_tt_supports_stage_inputs,
     validate_tt_lane_config,
+    validate_tt_scheduler_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.spec_admission import (
@@ -589,6 +592,22 @@ def _convert_dp_to_lanes(vllm_config: "VllmConfig", model_class=None) -> None:
     )
 
 
+def _register_kolibri1_hf_config() -> None:
+    """Make ``model_type: kolibri1`` loadable by ``AutoConfig``.
+
+    Aleph-Alpha/Kolibri-1 ships only a vLLM plugin upstream; Transformers has
+    no config class for it. A plain ``PretrainedConfig`` is enough: every
+    field the TT adapter reads (layer_types, sliding_window, head counts,
+    max_position_embeddings) comes verbatim from the checkpoint's config.json.
+    """
+    from transformers import AutoConfig, PretrainedConfig
+
+    class Kolibri1Config(PretrainedConfig):
+        model_type = "kolibri1"
+
+    AutoConfig.register("kolibri1", Kolibri1Config, exist_ok=True)
+
+
 def _register_model_if_missing(ModelRegistry, model_arch: str, model_path: str) -> None:
     """Register `model_arch` only if not already registered.
 
@@ -1110,7 +1129,7 @@ def _install_block_output_reset_abort_patch() -> None:
     ) -> bool:
         scheduler = self.scheduler
         require_tt_output_tokens_per_step(scheduler.vllm_config)
-        is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
+        cannot_resume = tt_requests_cannot_resume(scheduler.vllm_config)
         # Aborting is only legal when the engine can tell the owning clients
         # (EngineCoreProc._send_abort_outputs finishes their streams).
         # ``finish_requests`` emits no output itself -- upstream assumes the
@@ -1120,7 +1139,7 @@ def _install_block_output_reset_abort_patch() -> None:
         if (
             reset_running_requests
             and send_abort_outputs is not None
-            and is_block_output_model
+            and cannot_resume
             and scheduler.running
             and scheduler.pause_state != PauseState.PAUSED_ALL
         ):
@@ -1129,8 +1148,8 @@ def _install_block_output_reset_abort_patch() -> None:
                 RequestStatus.FINISHED_ABORTED,
             )
             logger.warning(
-                "Prefix-cache reset aborted %d running block-output "
-                "request(s); a half-generated canvas cannot resume.",
+                "Prefix-cache reset aborted %d running request(s) that cannot "
+                "resume (block output or stage outputs).",
                 len(aborted),
             )
             send_abort_outputs(aborted)
@@ -1168,18 +1187,17 @@ def _install_block_output_pause_guard_patch() -> None:
         def pause_scheduler_tt(self, mode="abort", clear_cache=True):
             scheduler = self.scheduler
             require_tt_output_tokens_per_step(scheduler.vllm_config)
-            is_block_output_model = is_tt_block_output_model(scheduler.vllm_config)
             if (
                 mode == "keep"
                 and clear_cache
-                and is_block_output_model
+                and tt_requests_cannot_resume(scheduler.vllm_config)
                 and scheduler.running
             ):
                 raise ValueError(
                     "pause_generation(mode='keep', clear_cache=True) cannot "
-                    "clear the cache of a live block-output request: a "
-                    "half-generated canvas cannot be preempted and resumed. "
-                    "Retry with clear_cache=False or mode='abort'."
+                    "clear the cache of a live request that cannot be preempted "
+                    "and resumed (block output or stage outputs). Retry with "
+                    "clear_cache=False or mode='abort'."
                 )
             return original(self, mode, clear_cache)
 
@@ -1466,6 +1484,20 @@ def register_tt_models(register_test_models=False) -> None:
         "TTGemma4UnifiedForConditionalGeneration",
     ):
         _register_model_if_missing(ModelRegistry, arch, _gemma4_target)
+
+    # Kolibri-1 (Aleph Alpha) model-local autoport, TP4 on Blackhole QB2.
+    # The checkpoint's ``model_type: kolibri1`` has no Transformers config
+    # class and no auto_map, so vLLM's config load fails before any
+    # architecture lookup unless the type is registered in every process
+    # (general plugins run in all of them). Upstream resolves the HF name
+    # before the TT platform prefixes it, so both spellings are registered.
+    _register_kolibri1_hf_config()
+    _kolibri1_target = (
+        "models.autoports.aleph_alpha_kolibri_1_bf16.tt.generator_vllm:"
+        "KolibriForCausalLM"
+    )
+    for arch in ("Kolibri1ForCausalLM", "TTKolibri1ForCausalLM"):
+        _register_model_if_missing(ModelRegistry, arch, _kolibri1_target)
 
     # DiffusionGemma registers above the builtin-map switch: one complete
     # 256-token canvas per model step. Upstream owns the bare
@@ -2254,8 +2286,6 @@ class TTPlatform(Platform):
         _install_tt_input_processor_patch()
         if is_block_output_model:
             _install_block_output_streaming_input_patch()
-            _install_block_output_reset_abort_patch()
-            _install_block_output_pause_guard_patch()
 
         # A model either supports the full on-device sampling pipeline or it
         # doesn't — there is no greedy-only mode. Models opt in by setting
@@ -2434,6 +2464,13 @@ class TTPlatform(Platform):
         validate_and_store_tt_supports_stage_inputs(
             vllm_config, model_capabilities, model_class, is_lane_mode
         )
+        resolve_tt_supports_stage_outputs(
+            vllm_config, model_capabilities, model_class, is_lane_mode
+        )
+        validate_tt_scheduler_config(vllm_config)
+        if tt_requests_cannot_resume(vllm_config):
+            _install_block_output_reset_abort_patch()
+            _install_block_output_pause_guard_patch()
         if is_lane_mode:
             # Fail fast on misconfiguration: lane mode requires max_num_seqs to
             # split evenly across the internal TT lanes.
@@ -2739,32 +2776,3 @@ class TTPlatform(Platform):
                 "This block-output model owns its Gumbel sampling and does not "
                 "support these request parameters: " + "; ".join(unsupported)
             )
-
-    @staticmethod
-    def compat_sampling_required(sampling_params, num_devices) -> bool:
-        # Device logprobs only supported on multi-device setups and only
-        # the sampled token's logprob is returned (not top-k alternatives).
-        # Single device: any logprobs require host sampling.
-        # Multi-device: logprobs > 1 requires host sampling because device
-        # can only return the sampled token's logprob.
-        # https://github.com/tenstorrent/tt-metal/issues/34077
-        if (
-            sampling_params.logprobs is not None
-            and sampling_params.logprobs > 0
-            and (num_devices == 1 or sampling_params.logprobs > 1)
-        ):
-            return True
-
-        # all of the following sampling params require compat sampling
-        return (
-            sampling_params.min_p != 0.0
-            or (
-                sampling_params.bad_words is not None
-                and len(sampling_params.bad_words) > 0
-            )
-            or sampling_params.prompt_logprobs is not None
-            or sampling_params.structured_outputs is not None
-            or sampling_params.logit_bias is not None
-            or sampling_params.allowed_token_ids is not None
-            or sampling_params.min_tokens != 0
-        )

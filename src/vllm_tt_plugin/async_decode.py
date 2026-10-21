@@ -37,6 +37,7 @@ from vllm_tt_plugin.spec_decode import (
     FusedReadout,
     VerifyOutput,
 )
+from vllm_tt_plugin.stage_outputs import TTStageFrame, pop_tt_stage_outputs
 from vllm_tt_plugin.structured_output import has_structured_outputs
 
 
@@ -125,6 +126,8 @@ class TTDecodeSubmission:
     # without interpreting its dtype, layout or tensor-parallel fracturing.
     spec_hidden: Any | None = None
     readback_rows: tuple[int, ...] | None = None
+    # A stage model's stage frames from this forward, popped right after it.
+    stage_outputs: dict[str, TTStageFrame] | None = None
 
 
 @dataclass(frozen=True)
@@ -1138,6 +1141,10 @@ class TTAsyncDecodeController:
         ended the request was already accepted. Only the late result is
         removed.
         """
+        # Prune before draining: completions are enqueued before their event
+        # is set, so every step pruned here is already in the queue the drain
+        # reads.
+        self.prune_finished_async_events()
         completed_steps = self.drain_completed_decode_steps()
         suppressed = set(suppress_output_req_ids or ())
         discard_counts = forced_reset_discard_counts or {}
@@ -1189,7 +1196,6 @@ class TTAsyncDecodeController:
                 skip_state_req_ids=suppressed | forced_reset_req_ids,
             )
             remaining_results.subtract(published_req_ids)
-        self.prune_finished_async_events()
 
     def apply_resolved_before_build(self, scheduler_output: SchedulerOutput) -> None:
         """Apply what resolved after the pre-build apply, before a host build.
@@ -1881,6 +1887,11 @@ class TTAsyncDecodeController:
                 "and on no other, so this step's return has no accepted "
                 "count to be read against"
             )
+        stage_outputs = None
+        if runner.supports_stage_outputs:
+            stage_outputs = pop_tt_stage_outputs(
+                runner.model, model_input, runner.requests
+            )
         # Input construction only proposed this layout/remap. Commit both at
         # the boundary where the model accepted the decode submission.
         runner.note_decode_layout_consumed()
@@ -1926,6 +1937,7 @@ class TTAsyncDecodeController:
             reload_plan=reload_plan,
             spec_hidden=spec_hidden,
             readback_rows=readback_rows,
+            stage_outputs=stage_outputs,
         )
 
     def complete_deferred_device_sampling(
