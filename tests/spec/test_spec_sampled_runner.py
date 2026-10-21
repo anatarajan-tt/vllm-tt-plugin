@@ -102,6 +102,7 @@ def _runner(model: SampledTarget, num_speculative_tokens: int = DRAFT_LEN):
         tt_data_parallel_size=1,
         max_num_blocks_per_req=MAX_MODEL_LEN // BLOCK_SIZE,
         supports_stage_inputs=False,
+        supports_stage_outputs=False,
         model_config=SimpleNamespace(
             is_multimodal_model=False, max_model_len=MAX_MODEL_LEN
         ),
