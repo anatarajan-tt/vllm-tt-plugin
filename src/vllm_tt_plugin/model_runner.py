@@ -1483,8 +1483,9 @@ class TTModelRunner:
 
     def _alloc_prefill_state_slots(self, row_req_ids: list[str]) -> list[int]:
         """Pick each prefilling request's state slot, skipping slots that live
-        off-batch requests own. Prefers its own row (where it decodes), so the
-        steady state moves nothing.
+        off-batch requests own. A continuation chunk keeps the slot it already
+        has; a new request prefers its own row (where it decodes), so the steady
+        state moves nothing.
 
         Exhaustion is unreachable: holders and prefills are disjoint and both count
         against ``max_num_seqs``, which is ``n_slots``. Getting here means the map has
@@ -1503,8 +1504,33 @@ class TTModelRunner:
             for req_id, slot in self._req_state_slot.items()
             if req_id not in prefilling and req_id in self.requests
         }
+        # A continuation chunk keeps the slot its first chunk wrote: the
+        # request's recurrent state lives there between chunks, and its
+        # persistent-batch row is not stable (``_update_states`` evicts a
+        # running request a step leaves out and re-adds it wherever a row is
+        # free). Preemption and finish drop the map entry
+        # (``_release_dead_state_slots``), so a request still in the map here
+        # is a continuation; a resumed one is a new request. Reserved before
+        # any new request picks, so a fresh ``slot = row`` cannot take it.
+        keep: dict[str, int] = {}
+        for req_id in row_req_ids:
+            slot = self._req_state_slot.get(req_id)
+            if slot is None:
+                continue
+            if not 0 <= slot < n_slots or slot in held:
+                raise RuntimeError(
+                    f"continuation request {req_id!r} owns state slot {slot}, "
+                    f"which is out of range or held by another request: "
+                    f"held={sorted(held)}, capacity={n_slots}, "
+                    f"map={self._req_state_slot}"
+                )
+            keep[req_id] = slot
+            held.add(slot)
         slots: list[int] = []
         for row, req_id in enumerate(row_req_ids):
+            if req_id in keep:
+                slots.append(keep[req_id])
+                continue
             if row not in held:
                 slot = row
             else:
@@ -4452,6 +4478,17 @@ class TTModelRunner:
         kwargs.update(model_input.multi_modal_kwargs)
         if model_input.stage_inputs is not None:
             kwargs["stage_inputs"] = model_input.stage_inputs
+        # A model that keeps per-chunk state (e.g. a snapshot to resume the next
+        # chunk from) must know which rows are NOT the last chunk of their
+        # prompt. Only models that declare the capability get the kwarg.
+        capabilities = getattr(self.model, "model_capabilities", None) or {}
+        if (
+            capabilities.get("accepts_intermediate_prefill_mask", False)
+            and model_input.intermediate_prefill_mask is not None
+        ):
+            kwargs["intermediate_prefill_mask"] = [
+                bool(x) for x in model_input.intermediate_prefill_mask.tolist()
+            ]
         if model_input.perform_device_sampling:
             sampling_params = model_input.tt_sampling_params
             sampling_param_dict = {
