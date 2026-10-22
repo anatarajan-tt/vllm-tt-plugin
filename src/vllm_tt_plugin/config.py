@@ -710,3 +710,62 @@ def get_tt_decode_interleave_config(
             _DECODE_INTERLEAVE_DECODE_STEPS_DEFAULT,
         ),
     )
+
+
+# Prefill-aware DP load reporting. The DP load balancer scores a rank by its
+# request counts, so a rank about to spend a minute inside one long prefill
+# looks as idle as one holding a short prompt. When enabled, the scheduler adds
+# a penalty of ceil(pending_prefill_tokens / tokens_per_unit) waiting requests.
+_DP_LOAD_PREFILL_AWARE_KEY = "dp_load_prefill_aware"
+_DP_LOAD_PREFILL_TOKENS_PER_UNIT_KEY = "dp_load_prefill_tokens_per_unit"
+_DP_LOAD_PREFILL_AWARE_DEFAULT = False
+_DP_LOAD_PREFILL_TOKENS_PER_UNIT_DEFAULT = 2048
+
+
+def get_tt_dp_load_config(vllm_config: "VllmConfig") -> tuple[bool, int]:
+    """Return ``(prefill_aware, tokens_per_unit)`` for DP load reporting."""
+    tt_config = get_tt_config(vllm_config)
+    return (
+        _read_tt_bool(
+            tt_config,
+            _DP_LOAD_PREFILL_AWARE_KEY,
+            _DP_LOAD_PREFILL_AWARE_DEFAULT,
+        ),
+        _read_tt_positive_int(
+            tt_config,
+            _DP_LOAD_PREFILL_TOKENS_PER_UNIT_KEY,
+            _DP_LOAD_PREFILL_TOKENS_PER_UNIT_DEFAULT,
+        ),
+    )
+
+
+# Long-prompt-alone admission. A prefill step is one blocking device call, so a
+# long prompt admitted together with short ones makes the short ones wait for
+# its whole prefill. With a threshold set, a step that could admit both admits
+# only the short ones, and a long prompt runs in a step with no short prompt.
+# A long prompt is deferred for at most ``max_defer_steps`` such steps.
+_LONG_PREFILL_ALONE_THRESHOLD_KEY = "long_prefill_alone_threshold"
+_LONG_PREFILL_ALONE_MAX_DEFER_KEY = "long_prefill_alone_max_defer_steps"
+_LONG_PREFILL_ALONE_THRESHOLD_DEFAULT = 0
+_LONG_PREFILL_ALONE_MAX_DEFER_DEFAULT = 8
+
+
+def get_tt_long_prefill_alone_config(vllm_config: "VllmConfig") -> tuple[int, int]:
+    """Return ``(threshold_tokens, max_defer_steps)``; threshold 0 disables."""
+    tt_config = get_tt_config(vllm_config)
+    threshold = tt_config.get(
+        _LONG_PREFILL_ALONE_THRESHOLD_KEY, _LONG_PREFILL_ALONE_THRESHOLD_DEFAULT
+    )
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_LONG_PREFILL_ALONE_THRESHOLD_KEY}'] must "
+            f"be an integer >= 0 (0 disables), got {threshold!r}"
+        )
+    return (
+        threshold,
+        _read_tt_positive_int(
+            tt_config,
+            _LONG_PREFILL_ALONE_MAX_DEFER_KEY,
+            _LONG_PREFILL_ALONE_MAX_DEFER_DEFAULT,
+        ),
+    )
