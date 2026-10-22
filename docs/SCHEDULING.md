@@ -211,6 +211,54 @@ Two things follow for the TT execution path:
   (device sampling would advance device RNG state for them), get a generator
   clone so the request's RNG does not drift, and report `[]` in the
   `ModelRunnerOutput` instead of a sampled token.
+- A model that declares `accepts_intermediate_prefill_mask` also receives that
+  mask as the `prefill_forward` keyword `intermediate_prefill_mask`
+  (`list[bool]`, `True` = not the last chunk).
+- A continuation chunk reuses the device state slot its first chunk was given
+  (`_alloc_prefill_state_slots`). The persistent-batch row of a partial prefill
+  changes between chunks, so the slot cannot follow the row.
+
+#### Multimodal requests are never split
+
+A chunk end inside or between a request's multimodal items would split its
+embeddings from their positions. In Mamba `align` cache mode (prefix caching on
+a hybrid model) vLLM requires `disable_chunked_mm_input=False`, so the platform
+leaves it `False` there and `TTScheduler` enforces the rule itself, in
+`_mamba_block_aligned_split` / `_align_prefill_chunk_end`
+(`_mm_no_split_grant`). A request with `mm_features` or encoder inputs gets
+either all its remaining tokens or nothing:
+
+- They fit in what is left of the step budget: they are granted, ignoring
+  `long_prefill_token_threshold` and vLLM's block-aligned clipping. The
+  leftover budget is the step cap minus the grants already made in this step,
+  so a grant never exceeds the real budget.
+- They fit a step, but not what is left: the hook returns 0. The waiting loop
+  stops admitting and retries the request next step, with a fresh budget; the
+  running loop skips it. It cannot starve: requests ahead of it finish their
+  chunks, and nothing is admitted behind it.
+- They exceed a whole step (`max_num_scheduled_tokens`, else
+  `max_num_batched_tokens`): splitting is unavoidable. The scheduler logs one
+  warning and splits the request on the alignment grid like a text request.
+
+Text requests behind a waiting multimodal request wait with it (FCFS).
+
+#### Depth-dependent chunk cap
+
+Attention cost per chunk grows with the depth it starts at, so a fixed chunk
+size gives steps of very different length. `additional_config["tt"]` accepts
+
+- `prefill_chunk_cap_table`: a list of `[start_tokens, max_chunk_tokens]`
+  pairs. A text chunk that starts at `start` holds at most the
+  `max_chunk_tokens` of the entry with the largest `start_tokens <= start`; a
+  chunk that starts below every entry is not capped. Default: empty, no cap.
+  Every cap must be a positive multiple of `prefill_chunk_alignment` (128 by
+  default); anything else is rejected at startup. Multimodal requests are never
+  capped. The cap runs in `_cap_prefill_chunk`, before the alignment step.
+
+A model may declare the same table as `model_capabilities["prefill_chunk_cap_table"]`;
+the platform copies it into `additional_config["tt"]` unless the operator set the key.
+
+Example: `{"tt": {"prefill_chunk_cap_table": [[0, 8192], [65536, 4096], [131072, 2048]]}}`.
 
 ### Decode interleave
 
