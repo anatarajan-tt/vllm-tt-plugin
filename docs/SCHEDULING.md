@@ -356,8 +356,14 @@ holding a short prompt. Two keys address that:
   `penalty = ceil(pending_prefill_tokens / dp_load_prefill_tokens_per_unit)`.
   `pending_prefill_tokens` sums `max(0, num_prompt_tokens - max(num_computed_tokens,
   num_cached_tokens))` over waiting requests and running partial prefills. A
-  waiting request that has not been through the prefix-cache lookup counts as
-  fully pending, so the penalty can overestimate.
+  waiting request has not been through the scheduler's prefix-cache lookup, so
+  its cached prefix is estimated with a read-only walk of `request.block_hashes`
+  over `BlockPool.get_cached_block` (a dict read: no ref counts, free-queue
+  moves, or prefix-cache stats). The estimate is capped at
+  `num_prompt_tokens - 1`, is 0 when prefix caching is off, the request skips
+  the cache (prompt logprobs), or the hash block size differs from the
+  scheduler block size. The cache can change before the request is admitted, so
+  it is an estimate. Running partial prefills use their real computed count.
 - `dp_load_prefill_tokens_per_unit` (default 2048, integer >= 1).
 - `long_prefill_alone_threshold` (default 0 = off, integer >= 0): a prompt
   whose pending tokens exceed this is "long". When a prefill step is built and

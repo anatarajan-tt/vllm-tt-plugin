@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import itertools
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -770,17 +771,51 @@ class TTScheduler(AsyncScheduler):
                 ", ".join(stripped),
             )
 
-    @staticmethod
-    def _pending_prefill_tokens(request: Request) -> int:
+    def _estimate_cached_prefix_tokens(self, request: Request) -> int:
+        """Estimate the prefix-cache hit of a request, with no side effects.
+
+        Mirrors ``KVCacheManager.get_computed_blocks`` for one full-attention
+        group: walk ``request.block_hashes`` from the start and count leading
+        hashes that ``BlockPool.get_cached_block`` finds. That call is a plain
+        dict read. It does not touch ref counts, the free queue, or the
+        prefix-cache stats, which ``get_computed_blocks`` and
+        ``record_prefix_cache_stats`` would. The hit is capped at
+        ``num_prompt_tokens - 1`` (vLLM always recomputes the last token) and
+        rounded down to whole blocks. Returns 0 when caching is off, the request
+        skips the cache, or anything needed is missing.
+        """
+        try:
+            manager = self.kv_cache_manager
+            if not manager.prefix_cache_lookup_enabled(request):
+                return 0
+            pool = manager.block_pool
+            block_size = int(self.block_size)
+            if block_size <= 0 or int(pool.hash_block_size) != block_size:
+                return 0
+            max_blocks = (int(request.num_prompt_tokens) - 1) // block_size
+            hits = 0
+            for block_hash in itertools.islice(request.block_hashes, max_blocks):
+                if not pool.get_cached_block(block_hash, [0]):
+                    break
+                hits += 1
+            return hits * block_size
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return 0
+
+    def _pending_prefill_tokens(self, request: Request, waiting: bool = False) -> int:
         """Prompt tokens a request still has to prefill, as far as known now.
 
-        A waiting request may not have been through the prefix-cache lookup yet,
-        so its count can be an overestimate.
+        A waiting request has not been through the scheduler's prefix-cache
+        lookup (``num_computed_tokens`` is 0), so with ``waiting=True`` its
+        cached prefix is estimated read-only. Running partial prefills pass
+        ``waiting=False`` and use their real computed count.
         """
         done = max(
             int(getattr(request, "num_computed_tokens", 0) or 0),
             int(getattr(request, "num_cached_tokens", -1) or 0),
         )
+        if waiting and done == 0:
+            done = self._estimate_cached_prefix_tokens(request)
         return max(0, int(request.num_prompt_tokens) - done)
 
     def get_request_counts(self) -> tuple[int, int]:
@@ -794,10 +829,10 @@ class TTScheduler(AsyncScheduler):
         running, waiting = super().get_request_counts()
         if not getattr(self, "_dp_load_prefill_aware", False):
             return running, waiting
-        pending = sum(self._pending_prefill_tokens(r) for r in self.waiting)
+        pending = sum(self._pending_prefill_tokens(r, True) for r in self.waiting)
         skipped = getattr(self, "skipped_waiting", None)
         if skipped is not None:
-            pending += sum(self._pending_prefill_tokens(r) for r in skipped)
+            pending += sum(self._pending_prefill_tokens(r, True) for r in skipped)
         pending += sum(
             self._pending_prefill_tokens(r) for r in self.running if r.is_prefill_chunk
         )
@@ -1053,7 +1088,9 @@ class TTScheduler(AsyncScheduler):
         if threshold <= 0:
             return None
         original = list(self.waiting)
-        longs = [r for r in original if self._pending_prefill_tokens(r) > threshold]
+        longs = [
+            r for r in original if self._pending_prefill_tokens(r, True) > threshold
+        ]
         if not longs or len(longs) == len(original):
             self._long_prefill_defer_steps = 0
             return None

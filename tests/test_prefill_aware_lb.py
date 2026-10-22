@@ -5,6 +5,8 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -237,3 +239,134 @@ def test_preempted_request_prepended_during_step_stays_first(monkeypatch):
     monkeypatch.setattr(AsyncScheduler, "schedule", fake_base)
     s._schedule_prefill_only()
     assert [r.request_id for r in s.waiting] == ["P", "L"]
+
+
+# --- read-only prefix-cache estimate ---------------------------------------
+
+BS = 16
+
+
+class _Mgr:
+    def __init__(self, pool, enable=True):
+        self.block_pool = pool
+        self.enable_caching = enable
+        self.prefix_cache_stats = object()
+
+    def prefix_cache_lookup_enabled(self, request):
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
+
+def _hashes(tag, n):
+    return [f"{tag}{i:04d}".encode().ljust(32, b"_") for i in range(n)]
+
+
+def _cached_sched(cached_hashes, *, enable=True, **tt):
+    pool = BlockPool(4096, True, BS)
+    for i, h in enumerate(cached_hashes):
+        pool.cached_block_hash_to_block.insert(
+            make_block_hash_with_group_id(h, 0), pool.blocks[i + 1]
+        )
+    s = _scheduler(**tt)
+    s.kv_cache_manager = _Mgr(pool, enable)
+    s.block_size = BS
+    return s, pool
+
+
+def _hreq(rid, prompt, hashes, skip=False, **kw):
+    r = _req(rid, prompt, **kw)
+    r.block_hashes = hashes
+    r.skip_reading_prefix_cache = skip
+    return r
+
+
+def _pool_state(pool, mgr):
+    return (
+        [b.ref_cnt for b in pool.blocks],
+        [b.block_id for b in pool.blocks if b.prev_free_block is None],
+        pool.free_block_queue.num_free_blocks,
+        {b.block_id: (b.prev_free_block, b.next_free_block) for b in pool.blocks},
+        dict(pool.cached_block_hash_to_block._cache),
+        mgr.prefix_cache_stats,
+    )
+
+
+def test_estimate_counts_leading_cached_blocks_capped():
+    h = _hashes("a", 100)
+    s, _ = _cached_sched(h[:60])
+    assert s._estimate_cached_prefix_tokens(_hreq("r", 100 * BS, h)) == 60 * BS
+    # Fully cached: last token must be recomputed -> one block less.
+    s2, _ = _cached_sched(h)
+    assert s2._estimate_cached_prefix_tokens(_hreq("r", 100 * BS, h)) == 99 * BS
+    # A gap stops the walk (chained hashes).
+    s3, _ = _cached_sched(h[:5] + h[6:20])
+    assert s3._estimate_cached_prefix_tokens(_hreq("r", 100 * BS, h)) == 5 * BS
+
+
+def test_estimate_zero_when_disabled_skipped_or_missing():
+    h = _hashes("a", 20)
+    s, _ = _cached_sched(h, enable=False)
+    assert s._estimate_cached_prefix_tokens(_hreq("r", 20 * BS, h)) == 0
+    s, _ = _cached_sched(h)
+    assert s._estimate_cached_prefix_tokens(_hreq("r", 20 * BS, h, skip=True)) == 0
+    assert s._estimate_cached_prefix_tokens(_req("x", 20 * BS)) == 0
+    bare = _scheduler()
+    assert bare._estimate_cached_prefix_tokens(_hreq("r", 20 * BS, h)) == 0
+    s.block_size = BS * 2  # hash size mismatch
+    assert s._estimate_cached_prefix_tokens(_hreq("r", 20 * BS, h)) == 0
+
+
+def test_estimate_has_no_side_effects():
+    h = _hashes("a", 30)
+    s, pool = _cached_sched(h[:20])
+    before = _pool_state(pool, s.kv_cache_manager)
+    for _ in range(3):
+        assert s._estimate_cached_prefix_tokens(_hreq("r", 30 * BS, h)) == 20 * BS
+    after = _pool_state(pool, s.kv_cache_manager)
+    assert before == after
+    assert before[-1] is after[-1]
+
+
+def test_cached_long_prompt_adds_no_penalty():
+    h = _hashes("a", 2000)
+    s, _ = _cached_sched(h[:1990], dp_load_prefill_aware=True)
+    s.waiting.add_request(_hreq("A", 2000 * BS, h))
+    # 32000 prompt tokens, 31840 cached -> 160 pending -> 1 unit + 1 waiting.
+    assert s.get_request_counts() == (0, 2)
+    cold, _ = _cached_sched([], dp_load_prefill_aware=True)
+    cold.waiting.add_request(_hreq("A", 2000 * BS, h))
+    assert cold.get_request_counts() == (0, 1 + 16)
+
+
+def test_partially_cached_penalty():
+    h = _hashes("a", 1000)
+    s, _ = _cached_sched(h[:500], dp_load_prefill_aware=True)
+    s.waiting.add_request(_hreq("A", 1000 * BS, h))
+    # 8000 pending tokens / 2048 -> 4 units.
+    assert s.get_request_counts() == (0, 1 + 4)
+
+
+def test_cached_long_not_deferred_cold_long_is_(monkeypatch):
+    h = _hashes("a", 2000)
+    s, _ = _cached_sched(h[:1990], long_prefill_alone_threshold=1000)
+    s.waiting.add_request(_hreq("A", 2000 * BS, h))
+    s.waiting.add_request(_req("s", 100))
+    assert _drive(s, 1, monkeypatch) == [["A", "s"]]
+    cold, _ = _cached_sched([], long_prefill_alone_threshold=1000)
+    cold.waiting.add_request(_hreq("A", 2000 * BS, h))
+    cold.waiting.add_request(_req("s", 100))
+    assert _drive(cold, 2, monkeypatch) == [["s"], ["A"]]
+
+
+def test_caching_disabled_counts_full_prompt():
+    h = _hashes("a", 100)
+    s, _ = _cached_sched(h, enable=False, dp_load_prefill_aware=True)
+    s.waiting.add_request(_hreq("A", 100 * BS, h))
+    assert s.get_request_counts() == (0, 1 + 1)  # 1600 tokens -> 1 unit
+
+
+def test_running_partial_prefill_ignores_estimate():
+    h = _hashes("a", 1000)
+    s, _ = _cached_sched(h, dp_load_prefill_aware=True)
+    r = _hreq("R", 1000 * BS, h, computed=1000, chunk=True)
+    s.running = [r]
+    assert s.get_request_counts() == (1, 0 + -(-(16000 - 1000) // 2048))
