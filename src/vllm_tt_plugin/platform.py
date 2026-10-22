@@ -35,6 +35,7 @@ from vllm_tt_plugin.config import (
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
     store_tt_output_tokens_per_step,
+    store_tt_prefill_chunk_cap_table_default,
     store_tt_spec_plan,
     store_tt_supports_device_grammar,
     tt_requests_cannot_resume,
@@ -252,7 +253,15 @@ def _apply_chunked_prefill_policy(
     # their positions. Only meaningful while prefill can be split, and vLLM
     # rejects the flag outright when one item exceeds the token budget, so it
     # stays off for every model that does not reach here.
-    scheduler_config.disable_chunked_mm_input = True
+    # vLLM's own config check rejects the flag in mamba "align" mode (prefix
+    # caching on a hybrid model), because the multimodal roll-back would undo the
+    # block-aligned split. There it stays False when the scheduler can keep a
+    # multimodal item whole by itself: text-only models have no items (vllm-tt-plugin
+    # PR #232), and a multimodal model that declares chunked prefill gets the
+    # ``TTScheduler`` no-split guard (``_align_prefill_chunk_end``).
+    cache_config = getattr(vllm_config, "cache_config", None)
+    mamba_align = getattr(cache_config, "mamba_cache_mode", None) == "align"
+    scheduler_config.disable_chunked_mm_input = not mamba_align
 
     # The only signal from outside the process that chunked prefill is active and
     # at what budget: the scheduler config is absent from /metrics and an
@@ -1968,6 +1977,9 @@ class TTPlatform(Platform):
                 "used by block-output models (output_tokens_per_step > 1)."
             )
         store_tt_output_tokens_per_step(vllm_config, output_tokens_per_step)
+        store_tt_prefill_chunk_cap_table_default(
+            vllm_config, (model_capabilities or {}).get("prefill_chunk_cap_table")
+        )
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
         # so the max_num_seqs=1 and data-parallel gates below are relaxed for
