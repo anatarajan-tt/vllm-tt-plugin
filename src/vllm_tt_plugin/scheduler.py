@@ -20,6 +20,7 @@ from vllm_tt_plugin.config import (
     get_tt_decode_interleave_config,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
+    get_tt_prefill_chunk_cap_table,
     get_tt_spec_plan,
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
@@ -407,6 +408,19 @@ class TTScheduler(AsyncScheduler):
                 "TT scheduler: partial prefill chunks end on %d-token boundaries",
                 self._prefill_chunk_alignment,
             )
+        self._prefill_chunk_cap_table = (
+            get_tt_prefill_chunk_cap_table(self.vllm_config)
+            if self._prefill_chunk_alignment > 1
+            else ()
+        )
+        if self._prefill_chunk_cap_table:
+            logger.info(
+                "TT scheduler: depth-dependent prefill chunk caps "
+                "[start_tokens, max_chunk_tokens]: %s",
+                [list(entry) for entry in self._prefill_chunk_cap_table],
+            )
+        self._step_prefill_tokens = 0
+        self._warned_mm_over_step = False
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
@@ -794,38 +808,145 @@ class TTScheduler(AsyncScheduler):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        if getattr(self, "_base_need_mamba_split", False):
-            num_new_tokens = super()._mamba_block_aligned_split(
-                request,
-                num_new_tokens,
-                num_new_local_computed_tokens,
-                num_external_computed_tokens,
-            )
         start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
             + num_external_computed_tokens
         )
-        return self._align_prefill_chunk_end(request, start, num_new_tokens)
+        # A multimodal request is never split, so vLLM's own block-aligned
+        # clipping (which would end a chunk at the last cacheable block) does
+        # not apply to it either.
+        grant = self._mm_no_split_grant(request, start, num_new_tokens)
+        if grant is None:
+            if getattr(self, "_base_need_mamba_split", False):
+                num_new_tokens = super()._mamba_block_aligned_split(
+                    request,
+                    num_new_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                )
+            num_new_tokens = self._cap_prefill_chunk(request, start, num_new_tokens)
+            grant = self._align_prefill_chunk_end(request, start, num_new_tokens)
+        if grant > 0 and start < self._prefill_end(request):
+            self._step_prefill_tokens = getattr(self, "_step_prefill_tokens", 0) + grant
+        return grant
+
+    @staticmethod
+    def _prefill_end(request: Request) -> int:
+        """First position that is not prompt prefill (resumed requests replay output)."""
+        return max(request.num_prompt_tokens, request.num_tokens - 1)
+
+    @staticmethod
+    def _has_mm_inputs(request: Request) -> bool:
+        return bool(
+            getattr(request, "mm_features", None)
+            or getattr(request, "has_encoder_inputs", False)
+        )
+
+    def _step_token_cap(self) -> int:
+        """Prompt tokens one step can schedule in total, ignoring the per-request
+        ``long_prefill_token_threshold``."""
+        cfg = getattr(self, "scheduler_config", None)
+        if cfg is None:
+            return sys.maxsize
+        scheduled = getattr(self, "max_num_scheduled_tokens", None)
+        if scheduled is None:
+            scheduled = getattr(cfg, "max_num_scheduled_tokens", None)
+        batched = int(getattr(cfg, "max_num_batched_tokens", 0) or 0) or sys.maxsize
+        return min(int(scheduled), batched) if scheduled is not None else batched
+
+    def _mm_no_split_grant(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int | None:
+        """Tokens to grant a multimodal prefill that must not be split.
+
+        A chunk end inside (or between) a request's multimodal items splits its
+        embeddings from their positions, and the model keeps no chunk state for
+        such a request. So a multimodal prompt is scheduled whole or not at all:
+
+        - all remaining tokens fit in what is left of this step's budget: grant
+          them, ignoring ``long_prefill_token_threshold`` (vLLM clips by it
+          before this hook runs; the leftover budget is tracked here from the
+          grants made earlier in the step, which is a lower bound of the real
+          one, so a grant never overshoots the step budget);
+        - they fit a step, but not what is left of this one: return 0. vLLM's
+          waiting loop then stops admitting (the request stays at the head of
+          the queue and gets a fresh budget next step) and its running loop
+          skips the request. Progress is guaranteed because the requests ahead
+          of it finish their chunks and nothing new is admitted behind it;
+        - they exceed even a whole step: ``None``. Splitting is unavoidable,
+          so the caller treats the request like a text one (aligned chunks).
+
+        ``None`` is also returned for text requests and for requests past their
+        prefill, which take the normal path.
+        """
+        if num_new_tokens <= 0 or not self._has_mm_inputs(request):
+            return None
+        if start >= self._prefill_end(request):
+            return None
+        remaining = request.num_tokens - start
+        cap = self._step_token_cap()
+        if remaining > cap:
+            if not getattr(self, "_warned_mm_over_step", False):
+                self._warned_mm_over_step = True
+                logger.warning(
+                    "TT scheduler: a multimodal prompt needs %d prefill tokens, "
+                    "more than one step can schedule (%d); it is split.",
+                    remaining,
+                    cap,
+                )
+            return None
+        if remaining <= cap - getattr(self, "_step_prefill_tokens", 0):
+            return remaining
+        return 0
+
+    def _cap_prefill_chunk(
+        self, request: Request, start: int, num_new_tokens: int
+    ) -> int:
+        """Cap a text prefill chunk by the prompt depth it starts at.
+
+        ``prefill_chunk_cap_table`` is a step function: the entry with the
+        largest ``start_tokens <= start`` gives the most tokens one chunk may
+        hold, so deep chunks (costly: attention grows with depth) stay short
+        enough to bound a step's duration. Multimodal requests are never split,
+        so never capped. Caps are multiples of the chunk alignment, so a capped
+        chunk from an aligned start ends on the grid.
+        """
+        table = getattr(self, "_prefill_chunk_cap_table", ())
+        if not table or num_new_tokens <= 0:
+            return num_new_tokens
+        if self._has_mm_inputs(request) or start >= self._prefill_end(request):
+            return num_new_tokens
+        cap = None
+        for entry_start, entry_cap in table:
+            if entry_start > start:
+                break
+            cap = entry_cap
+        if cap is None:
+            return num_new_tokens
+        return min(num_new_tokens, cap)
 
     def _align_prefill_chunk_end(
         self, request: Request, start: int, num_new_tokens: int
     ) -> int:
         """Round a *partial* prefill chunk down so it ends on the alignment grid.
 
-        Chunks that finish the prompt, decode steps and multimodal prompts are
-        left alone. A new request whose aligned chunk would be empty waits for
-        the next step; a running request never gets an empty chunk.
+        Chunks that finish the prompt and decode steps are left alone. A
+        multimodal prompt is never split (``_mm_no_split_grant``); only one that
+        cannot fit a whole step falls through to the alignment. A new request
+        whose aligned chunk would be empty waits for the next step; a running
+        request never gets an empty chunk.
         """
         align = getattr(self, "_prefill_chunk_alignment", 0)
-        if align <= 1 or num_new_tokens <= 0:
+        if num_new_tokens <= 0:
+            return num_new_tokens
+        grant = self._mm_no_split_grant(request, start, num_new_tokens)
+        if grant is not None:
+            return grant
+        if align <= 1:
             return num_new_tokens
         end = start + num_new_tokens
         if end >= request.num_prompt_tokens:
-            return num_new_tokens
-        if getattr(request, "mm_features", None) or getattr(
-            request, "has_encoder_inputs", False
-        ):
             return num_new_tokens
         aligned_end = end // align * align
         if aligned_end <= start:
@@ -852,6 +973,7 @@ class TTScheduler(AsyncScheduler):
         # mutates anything: the skip condition is a pure function of request
         # state, and the loop advances ``num_computed_tokens`` of the requests
         # it does schedule.
+        self._step_prefill_tokens = 0
         self._finishing_candidates = [
             request.request_id
             for request in self.running

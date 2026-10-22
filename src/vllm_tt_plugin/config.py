@@ -681,6 +681,98 @@ def get_tt_prefill_chunk_alignment(vllm_config: "VllmConfig") -> int:
     return value
 
 
+_PREFILL_CHUNK_CAP_TABLE_KEY = "prefill_chunk_cap_table"
+
+
+def parse_prefill_chunk_cap_table(
+    raw: Any, alignment: int, *, source: str = "prefill_chunk_cap_table"
+) -> tuple[tuple[int, int], ...]:
+    """Validate a depth-dependent chunk cap table; returns sorted ``(start, cap)``.
+
+    ``raw`` is a list of ``[start_tokens, max_chunk_tokens]`` pairs: a step
+    function in the prompt depth a chunk starts at. A chunk that starts at
+    ``start`` is capped by the entry with the largest ``start_tokens <= start``;
+    a chunk that starts below every entry is not capped. Empty or ``None`` means
+    no cap. Every cap must be a positive multiple of the prefill chunk
+    ``alignment`` (when alignment > 1), or a capped chunk would end off the grid.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(f"{source} must be a list of [start_tokens, cap] pairs")
+    entries: dict[int, int] = {}
+    for item in raw:
+        if (
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in item)
+        ):
+            raise ValueError(
+                f"{source} entries must be [start_tokens, max_chunk_tokens] "
+                f"integer pairs, got {item!r}"
+            )
+        start, cap = int(item[0]), int(item[1])
+        if start < 0 or cap <= 0:
+            raise ValueError(
+                f"{source} entry {item!r} needs start_tokens >= 0 and "
+                "max_chunk_tokens > 0"
+            )
+        if alignment > 1 and cap % alignment != 0:
+            raise ValueError(
+                f"{source} cap {cap} must be a multiple of the prefill chunk "
+                f"alignment {alignment}"
+            )
+        if start in entries:
+            raise ValueError(f"{source} has two entries for start_tokens={start}")
+        entries[start] = cap
+    return tuple(sorted(entries.items()))
+
+
+def get_tt_prefill_chunk_cap_table(
+    vllm_config: "VllmConfig",
+) -> tuple[tuple[int, int], ...]:
+    """Depth-dependent cap on one text prefill chunk (empty = no cap).
+
+    Read from ``additional_config["tt"]["prefill_chunk_cap_table"]``. The
+    platform fills the key from the model's ``prefill_chunk_cap_table``
+    capability when the operator did not set it.
+    """
+    tt_config = get_tt_config(vllm_config)
+    return parse_prefill_chunk_cap_table(
+        tt_config.get(_PREFILL_CHUNK_CAP_TABLE_KEY),
+        get_tt_prefill_chunk_alignment(vllm_config),
+        source=f"additional_config['tt']['{_PREFILL_CHUNK_CAP_TABLE_KEY}']",
+    )
+
+
+def store_tt_prefill_chunk_cap_table_default(
+    vllm_config: "VllmConfig", table: Any
+) -> None:
+    """Copy the model's declared cap table into ``additional_config["tt"]``.
+
+    An operator-set value wins. The declared table is validated here so a bad
+    model declaration fails at config time, not at the first long prompt.
+    """
+    if table is None:
+        return
+    parse_prefill_chunk_cap_table(
+        table,
+        get_tt_prefill_chunk_alignment(vllm_config),
+        source="model_capabilities['prefill_chunk_cap_table']",
+    )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    tt = additional.get("tt")
+    if tt is None:
+        tt = {}
+        additional["tt"] = tt
+    if not isinstance(tt, dict):
+        return
+    tt.setdefault(_PREFILL_CHUNK_CAP_TABLE_KEY, [list(p) for p in table])
+
+
 def get_tt_decode_interleave_config(
     vllm_config: "VllmConfig",
 ) -> tuple[bool, int, int]:
