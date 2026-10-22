@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import itertools
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING, cast
@@ -18,6 +19,8 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_dp_load_config,
+    get_tt_long_prefill_alone_config,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_prefill_chunk_cap_table,
@@ -379,6 +382,17 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        (
+            self._dp_load_prefill_aware,
+            self._dp_load_tokens_per_unit,
+        ) = get_tt_dp_load_config(self.vllm_config)
+        (
+            self._long_prefill_threshold,
+            self._long_prefill_max_defer,
+        ) = get_tt_long_prefill_alone_config(self.vllm_config)
+        # Consecutive prefill steps that hid a long prompt behind short ones.
+        self._long_prefill_defer_steps = 0
+        self._long_prefill_hidden_ids: set[str] = set()
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -771,6 +785,74 @@ class TTScheduler(AsyncScheduler):
                 ", ".join(stripped),
             )
 
+    def _estimate_cached_prefix_tokens(self, request: Request) -> int:
+        """Estimate the prefix-cache hit of a request, with no side effects.
+
+        Mirrors ``KVCacheManager.get_computed_blocks`` for one full-attention
+        group: walk ``request.block_hashes`` from the start and count leading
+        hashes that ``BlockPool.get_cached_block`` finds. That call is a plain
+        dict read. It does not touch ref counts, the free queue, or the
+        prefix-cache stats, which ``get_computed_blocks`` and
+        ``record_prefix_cache_stats`` would. The hit is capped at
+        ``num_prompt_tokens - 1`` (vLLM always recomputes the last token) and
+        rounded down to whole blocks. Returns 0 when caching is off, the request
+        skips the cache, or anything needed is missing.
+        """
+        try:
+            manager = self.kv_cache_manager
+            if not manager.prefix_cache_lookup_enabled(request):
+                return 0
+            pool = manager.block_pool
+            block_size = int(self.block_size)
+            if block_size <= 0 or int(pool.hash_block_size) != block_size:
+                return 0
+            max_blocks = (int(request.num_prompt_tokens) - 1) // block_size
+            hits = 0
+            for block_hash in itertools.islice(request.block_hashes, max_blocks):
+                if not pool.get_cached_block(block_hash, [0]):
+                    break
+                hits += 1
+            return hits * block_size
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return 0
+
+    def _pending_prefill_tokens(self, request: Request, waiting: bool = False) -> int:
+        """Prompt tokens a request still has to prefill, as far as known now.
+
+        A waiting request has not been through the scheduler's prefix-cache
+        lookup (``num_computed_tokens`` is 0), so with ``waiting=True`` its
+        cached prefix is estimated read-only. Running partial prefills pass
+        ``waiting=False`` and use their real computed count.
+        """
+        done = max(
+            int(getattr(request, "num_computed_tokens", 0) or 0),
+            int(getattr(request, "num_cached_tokens", -1) or 0),
+        )
+        if waiting and done == 0:
+            done = self._estimate_cached_prefix_tokens(request)
+        return max(0, int(request.num_prompt_tokens) - done)
+
+    def get_request_counts(self) -> tuple[int, int]:
+        """Return ``(num_running, num_waiting)`` as the DP load balancer reads it.
+
+        With ``dp_load_prefill_aware`` the waiting count grows by one unit per
+        ``dp_load_prefill_tokens_per_unit`` pending prefill tokens (waiting
+        requests and running partial prefills), so a rank facing a long prefill
+        looks busy before the blocking step starts.
+        """
+        running, waiting = super().get_request_counts()
+        if not getattr(self, "_dp_load_prefill_aware", False):
+            return running, waiting
+        pending = sum(self._pending_prefill_tokens(r, True) for r in self.waiting)
+        skipped = getattr(self, "skipped_waiting", None)
+        if skipped is not None:
+            pending += sum(self._pending_prefill_tokens(r, True) for r in skipped)
+        pending += sum(
+            self._pending_prefill_tokens(r) for r in self.running if r.is_prefill_chunk
+        )
+        penalty = -(-pending // self._dp_load_tokens_per_unit)
+        return running, waiting + penalty
+
     def _has_pending_prefill(self) -> bool:
         """Whether any request still needs prefill work.
 
@@ -1106,12 +1188,67 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        hidden = self._hide_for_long_prefill_alone()
         try:
             result = super().schedule()
         finally:
+            self._restore_hidden_waiting(hidden)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
+
+    def _hide_for_long_prefill_alone(self) -> list[Request] | None:
+        """Hide part of the waiting queue so a step never mixes long and short.
+
+        Returns the original waiting order when something was hidden, else
+        ``None``. Longs (pending prompt tokens above the threshold) wait while a
+        short one is waiting, for at most ``long_prefill_alone_max_defer_steps``
+        consecutive steps; after that the shorts wait and the longs run alone,
+        which bounds a long prompt's delay. FCFS holds within each class.
+        """
+        threshold = getattr(self, "_long_prefill_threshold", 0)
+        if threshold <= 0:
+            return None
+        original = list(self.waiting)
+        longs = [
+            r for r in original if self._pending_prefill_tokens(r, True) > threshold
+        ]
+        if not longs or len(longs) == len(original):
+            self._long_prefill_defer_steps = 0
+            return None
+        if self._long_prefill_defer_steps < self._long_prefill_max_defer:
+            self._long_prefill_defer_steps += 1
+            hide = longs
+        else:
+            self._long_prefill_defer_steps = 0
+            long_ids = {r.request_id for r in longs}
+            hide = [r for r in original if r.request_id not in long_ids]
+        self.waiting.remove_requests(set(hide))
+        self._long_prefill_hidden_ids = {r.request_id for r in hide}
+        return original
+
+    def _restore_hidden_waiting(self, original: list[Request] | None) -> None:
+        """Put hidden requests back, in their original order within ``waiting``.
+
+        Requests the base scheduler prepended meanwhile (preemptions) stay in
+        front; requests it scheduled or moved elsewhere are not re-added.
+        """
+        if original is None:
+            return
+        hidden_ids = self._long_prefill_hidden_ids
+        self._long_prefill_hidden_ids = set()
+        original_ids = {r.request_id for r in original}
+        remaining = list(self.waiting)
+        remaining_ids = {r.request_id for r in remaining}
+        extras = [r for r in remaining if r.request_id not in original_ids]
+        ordered = [
+            r
+            for r in original
+            if r.request_id in hidden_ids or r.request_id in remaining_ids
+        ]
+        self.waiting.remove_requests(set(remaining))
+        for request in extras + ordered:
+            self.waiting.add_request(request)
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
