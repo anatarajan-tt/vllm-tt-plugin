@@ -413,6 +413,12 @@ holding a short prompt. Two keys address that:
   scheduler block size. The cache can change before the request is admitted, so
   it is an estimate. Running partial prefills use their real computed count.
 - `dp_load_prefill_tokens_per_unit` (default 2048, integer >= 1).
+- `dp_load_prefill_min_tokens` (default 8192, integer >= 0): a request adds to
+  `pending_prefill_tokens` only if its own pending tokens are at least this
+  value; smaller requests add 0. Ordinary 1-10K prompts then publish exactly
+  vLLM's base counts and do not change DP routing (a penalty on every request
+  broke the rank affinity of multi-turn follow-ups). The per-unit rounding
+  applies to the sum over the requests that count. 0 counts every request.
 - `long_prefill_alone_threshold` (default 0 = off, integer >= 0): a prompt
   whose pending tokens exceed this is "long". When a prefill step is built and
   the waiting queue holds both long and short requests, only the short ones are

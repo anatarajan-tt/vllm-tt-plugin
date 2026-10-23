@@ -39,6 +39,7 @@ def _req(rid, prompt, computed=0, cached=-1, chunk=False):
 
 
 def _scheduler(*, waiting=(), skipped=(), running=(), **tt):
+    tt.setdefault("dp_load_prefill_min_tokens", 0)  # tests opt in to the floor
     s = TTScheduler.__new__(TTScheduler)
     s.policy = SchedulingPolicy.FCFS
     s.waiting = create_request_queue(s.policy)
@@ -51,7 +52,11 @@ def _scheduler(*, waiting=(), skipped=(), running=(), **tt):
     s.max_num_running_reqs = 8
     s._forced_mode = TTSchedulingMode.DEFAULT
     cfg = _cfg(**tt)
-    s._dp_load_prefill_aware, s._dp_load_tokens_per_unit = get_tt_dp_load_config(cfg)
+    (
+        s._dp_load_prefill_aware,
+        s._dp_load_tokens_per_unit,
+        s._dp_load_min_tokens,
+    ) = get_tt_dp_load_config(cfg)
     (
         s._long_prefill_threshold,
         s._long_prefill_max_defer,
@@ -65,7 +70,7 @@ def _scheduler(*, waiting=(), skipped=(), running=(), **tt):
 
 
 def test_defaults_are_off():
-    assert get_tt_dp_load_config(_cfg()) == (False, 2048)
+    assert get_tt_dp_load_config(_cfg()) == (False, 2048, 8192)
     assert get_tt_long_prefill_alone_config(_cfg()) == (0, 8)
 
 
@@ -75,6 +80,9 @@ def test_defaults_are_off():
         {"dp_load_prefill_aware": 1},
         {"dp_load_prefill_tokens_per_unit": 0},
         {"dp_load_prefill_tokens_per_unit": True},
+        {"dp_load_prefill_min_tokens": -1},
+        {"dp_load_prefill_min_tokens": 1.5},
+        {"dp_load_prefill_min_tokens": True},
         {"long_prefill_alone_threshold": -1},
         {"long_prefill_alone_threshold": 1.5},
         {"long_prefill_alone_threshold": True},
@@ -125,6 +133,53 @@ def test_penalty_is_zero_with_nothing_pending():
     s = _scheduler(dp_load_prefill_aware=True)
     assert s.get_request_counts() == (0, 0)
     s = _scheduler(waiting=[_req("a", 100, computed=100)], dp_load_prefill_aware=True)
+    assert s.get_request_counts() == (0, 1)
+
+
+def test_below_min_tokens_adds_nothing():
+    s = _scheduler(
+        waiting=[_req("a", 8_191), _req("b", 1_000)],
+        skipped=[_req("c", 5_000)],
+        running=[_req("r", 8_000, chunk=True)],
+        dp_load_prefill_aware=True,
+        dp_load_prefill_min_tokens=8192,
+    )
+    assert s.get_request_counts() == (1, 3)  # base counts only
+
+
+def test_at_or_above_min_tokens_adds_ceil_pending_over_unit():
+    s = _scheduler(
+        waiting=[_req("a", 8_192)],
+        dp_load_prefill_aware=True,
+        dp_load_prefill_min_tokens=8192,
+    )
+    assert s.get_request_counts() == (0, 1 + 4)
+    s = _scheduler(
+        waiting=[_req("a", 10_000)],
+        dp_load_prefill_aware=True,
+        dp_load_prefill_min_tokens=8192,
+    )
+    assert s.get_request_counts() == (0, 1 + 5)  # ceil(10000 / 2048)
+
+
+def test_mixed_only_long_requests_count():
+    s = _scheduler(
+        waiting=[_req("s", 3_000), _req("L", 20_000)],
+        skipped=[_req("s2", 8_000)],
+        running=[_req("r", 12_000, computed=2_000, chunk=True)],
+        dp_load_prefill_aware=True,
+        dp_load_prefill_min_tokens=8192,
+    )
+    # counts: 20000 and 10000 (running); 3000 and 8000 are below the floor.
+    # ceil(30000 / 2048) = 15; base (1, 3)
+    assert s.get_request_counts() == (1, 3 + 15)
+
+
+def test_min_tokens_uses_cache_aware_pending():
+    h = _hashes("a", 1000)
+    s, _ = _cached_sched(h[:600], dp_load_prefill_aware=True, dp_load_prefill_min_tokens=8192)
+    s.waiting.add_request(_hreq("A", 1000 * BS, h))
+    # 16000 tokens, 9600 cached -> 6400 pending < 8192 -> no penalty.
     assert s.get_request_counts() == (0, 1)
 
 
