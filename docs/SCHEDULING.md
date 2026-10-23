@@ -260,6 +260,55 @@ the platform copies it into `additional_config["tt"]` unless the operator set th
 
 Example: `{"tt": {"prefill_chunk_cap_table": [[0, 8192], [65536, 4096], [131072, 2048]]}}`.
 
+#### FCFS limit for multi-chunk prefills
+
+vLLM caps a prefill chunk per request (`long_prefill_token_threshold`), not per
+step, and the TT step budget is large. So every running partial prefill and
+every waiting prompt gets a chunk each step: N long prompts on a rank advance
+round-robin and all finish together, so the first one's first token waits for
+the work of all N. Without chunking they ran first come, first served.
+
+`additional_config["tt"]["max_concurrent_partial_prefills"]` (integer >= 0,
+default 0 = unlimited, validated at startup) restores FCFS. With a limit L > 0,
+a prefill step advances at most L requests that *need more than one chunk*:
+requests whose uncached rest of the prompt exceeds the chunk cap for this step
+(`_chunk_cap_for`: step budget, `long_prefill_token_threshold`, and the
+`prefill_chunk_cap_table` entry for the request's depth; a multimodal request
+is never split, so its cap is a whole step). A request whose rest fits one
+chunk (a short prompt, or the final chunk of a long one) is always admitted as
+before, subject to the normal budget, so shorts never wait behind a long one.
+
+Order is first come, first served: running partial prefills first, in running
+(admission) order, then waiting requests in queue order. `_schedule_prefill_only`
+hides the surplus for that one base `schedule()` call:
+
+- Running surplus leaves `self.running`, so the base loop cannot schedule,
+  preempt, or free it. Its `num_computed_tokens`, blocks and state slot are
+  untouched. It goes back at its original position afterwards, ahead of
+  requests admitted in the same call. It still holds a running slot, so
+  `max_num_running_reqs` is reduced for the call.
+- Waiting surplus leaves `self.waiting` and returns in its original order
+  (requests the base call preempted stay in front).
+
+Hiding exists only inside that call. `_has_pending_prefill`, the interleave
+policy and the decode-only paths see every partial prefill as pending work, so
+decode interleave and the decode fallback behave as without the limit. Only
+`waiting` is limited; `skipped_waiting` (structured-output requests that wait
+on a grammar) is not. A waiting request's cached prefix is not counted until it
+is admitted, unless the scheduler can estimate it read-only.
+
+With `long_prefill_alone_threshold` (long-prompt-alone admission, load-balancing
+branch) both apply in sequence: first the alone rule hides longs or shorts from
+`waiting`, then this limit hides surplus multi-chunk requests among what is
+left. A step then holds at most L multi-chunk prefills, and a long prompt is
+not mixed with short ones while the alone rule defers it. The alone rule
+judges a prompt by its whole pending size; this limit judges it by chunk
+count. The two do not conflict: each only removes requests from this step.
+
+Example: with L=1 and three 20k prompts at a 4096-token chunk, the first runs
+alone until it finishes (about 5 steps), then the second, then the third; its
+first token arrives after 5 steps, not 15.
+
 ### Decode interleave
 
 Preferring prefill whenever prefill work is pending has one bad consequence.

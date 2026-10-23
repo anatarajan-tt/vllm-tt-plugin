@@ -655,6 +655,24 @@ def _read_tt_positive_int(tt_config: dict[str, Any], key: str, default: int) -> 
     return value
 
 
+# FCFS limit for multi-chunk prefills. vLLM gives every running partial prefill
+# and every waiting prompt a chunk each step, so N long prompts progress in
+# lockstep and all finish together. With a limit L > 0, a prefill step advances
+# at most L requests that need more than one chunk; 0 means unlimited.
+_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY = "max_concurrent_partial_prefills"
+
+
+def get_tt_max_concurrent_partial_prefills(vllm_config: "VllmConfig") -> int:
+    """Return the multi-chunk prefill limit per step; 0 means unlimited."""
+    value = get_tt_config(vllm_config).get(_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_MAX_CONCURRENT_PARTIAL_PREFILLS_KEY}'] "
+            f"must be an integer >= 0 (0 = unlimited), got {value!r}"
+        )
+    return value
+
+
 _PREFILL_CHUNK_ALIGNMENT_KEY = "prefill_chunk_alignment"
 # TT chunked prefill walks a prompt in SDPA chunks of 128 query rows; a chunk
 # that starts off that grid is realigned down by the model and the whole

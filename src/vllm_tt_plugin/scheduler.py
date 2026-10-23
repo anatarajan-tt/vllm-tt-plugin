@@ -18,6 +18,7 @@ from vllm_tt_plugin.config import (
     get_tt_adaptive_block_max_prompt_tokens,
     get_tt_block_kv_extent_tokens,
     get_tt_decode_interleave_config,
+    get_tt_max_concurrent_partial_prefills,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_prefill_chunk_cap_table,
@@ -368,6 +369,9 @@ class TTScheduler(AsyncScheduler):
       prefill cannot make progress and running decode requests exist.
     """
 
+    # Class default: a scheduler built without __init__ (tests) is unlimited.
+    _max_partial_prefills = 0
+
     waiting: RequestQueue
     running: list[Request]
     max_num_running_reqs: int
@@ -379,6 +383,9 @@ class TTScheduler(AsyncScheduler):
         # before every one of its lanes' schedule() calls and owns the one
         # policy instance for the whole step, so this one stays dormant there.
         self._decode_interleave = TTDecodeInterleavePolicy(self.vllm_config)
+        self._max_partial_prefills = get_tt_max_concurrent_partial_prefills(
+            self.vllm_config
+        )
         self._pending_forced_reset_discard_counts: dict[str, int] = {}
         # Block-step decisions for the step currently being committed, read off
         # its SchedulerOutput in update_from_output so _update_request_with_output
@@ -1106,12 +1113,127 @@ class TTScheduler(AsyncScheduler):
         saved_max = self.max_num_running_reqs
         self.running = cast(list[Request], partial_prefills)
         self.max_num_running_reqs = max(0, saved_max - len(pure_decodes))
+        hidden_running, slots = self._hide_running_multi_chunk()
+        # Hidden partial prefills still hold a running slot.
+        self.max_num_running_reqs = max(
+            0, self.max_num_running_reqs - len(hidden_running)
+        )
+        hidden_waiting = self._hide_waiting_multi_chunk(slots)
         try:
             result = super().schedule()
         finally:
+            self._restore_waiting_multi_chunk(hidden_waiting)
+            self._restore_running_multi_chunk(partial_prefills, hidden_running)
             self.running.extend(pure_decodes)
             self.max_num_running_reqs = saved_max
         return result
+
+    def _chunk_cap_for(self, request: Request, start: int) -> int:
+        """Most prompt tokens the next chunk of ``request`` can hold."""
+        if self._has_mm_inputs(request):
+            # Never split unless it exceeds a whole step.
+            return self._step_token_cap()
+        return self._cap_prefill_chunk(request, start, self._full_step_prefill_cap())
+
+    def _needs_multiple_chunks(self, request: Request, waiting: bool) -> bool:
+        """Whether the uncached rest of the prompt exceeds one chunk."""
+        done = int(getattr(request, "num_computed_tokens", 0) or 0)
+        if waiting and done == 0:
+            # Cache-aware when the scheduler can estimate a prefix hit.
+            estimate = getattr(self, "_estimate_cached_prefix_tokens", None)
+            done = estimate(request) if estimate is not None else 0
+        remaining = self._prefill_end(request) - done
+        return remaining > self._chunk_cap_for(request, done)
+
+    def _hide_running_multi_chunk(self) -> tuple[list[Request], int]:
+        """Hide running partial prefills beyond the multi-chunk limit.
+
+        Walks ``self.running`` (partial prefills only, in running order, which
+        is admission order) and keeps the first ``limit`` that still need more
+        than one chunk; every request that finishes in one chunk stays. Hidden
+        requests leave ``self.running`` for this base call only, so the base
+        loop neither schedules, preempts, nor frees them; their
+        ``num_computed_tokens`` and blocks are untouched. Returns the hidden
+        requests and the multi-chunk slots left for waiting requests.
+        """
+        limit = self._max_partial_prefills
+        if limit <= 0:
+            return [], sys.maxsize
+        slots = limit
+        hidden: list[Request] = []
+        keep: list[Request] = []
+        for r in self.running:
+            if self._needs_multiple_chunks(r, waiting=False):
+                if slots > 0:
+                    slots -= 1
+                else:
+                    hidden.append(r)
+                    continue
+            keep.append(r)
+        self.running = keep
+        return hidden, slots
+
+    def _restore_running_multi_chunk(
+        self, original: list[Request], hidden: list[Request]
+    ) -> None:
+        """Put hidden partial prefills back at their original running position."""
+        if not hidden:
+            return
+        hidden_ids = {r.request_id for r in hidden}
+        live = {r.request_id for r in self.running}
+        ordered = [
+            r for r in original if r.request_id in hidden_ids or r.request_id in live
+        ]
+        known = {r.request_id for r in original}
+        extras = [r for r in self.running if r.request_id not in known]
+        self.running = ordered + extras
+
+    def _hide_waiting_multi_chunk(
+        self, slots: int
+    ) -> tuple[list[Request], set[str]] | None:
+        """Hide waiting multi-chunk requests beyond the slots left (FCFS).
+
+        Waiting requests that fit in one chunk are never hidden. Returns the
+        original queue order and the hidden ids, or ``None`` if nothing hid.
+        """
+        if self._max_partial_prefills <= 0:
+            return None
+        original = list(self.waiting)
+        hide: list[Request] = []
+        for r in original:
+            if self._needs_multiple_chunks(r, waiting=True):
+                if slots > 0:
+                    slots -= 1
+                else:
+                    hide.append(r)
+        if not hide:
+            return None
+        self.waiting.remove_requests(set(hide))
+        return original, {r.request_id for r in hide}
+
+    def _restore_waiting_multi_chunk(
+        self, saved: tuple[list[Request], set[str]] | None
+    ) -> None:
+        """Put hidden waiting requests back in their original queue order.
+
+        Requests the base scheduler prepended meanwhile (preemptions) stay in
+        front; requests it scheduled or moved elsewhere are not re-added.
+        """
+        if saved is None:
+            return
+        original, hidden_ids = saved
+        original_ids = {r.request_id for r in original}
+        remaining = list(self.waiting)
+        remaining_ids = {r.request_id for r in remaining}
+        extras = [r for r in remaining if r.request_id not in original_ids]
+        ordered = [
+            r
+            for r in original
+            if r.request_id in hidden_ids or r.request_id in remaining_ids
+        ]
+        self.waiting.remove_requests(set(remaining))
+        for request in extras + ordered:
+            self.waiting.add_request(request)
 
     def _schedule_decode_only(self) -> SchedulerOutput:
         """Schedule only running decode requests.
