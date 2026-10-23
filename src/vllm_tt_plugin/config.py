@@ -716,15 +716,27 @@ def get_tt_decode_interleave_config(
 # request counts, so a rank about to spend a minute inside one long prefill
 # looks as idle as one holding a short prompt. When enabled, the scheduler adds
 # a penalty of ceil(pending_prefill_tokens / tokens_per_unit) waiting requests.
+# Only requests with at least ``min_tokens`` pending tokens count, so ordinary
+# prompts leave vLLM's own routing counts untouched.
 _DP_LOAD_PREFILL_AWARE_KEY = "dp_load_prefill_aware"
 _DP_LOAD_PREFILL_TOKENS_PER_UNIT_KEY = "dp_load_prefill_tokens_per_unit"
+_DP_LOAD_PREFILL_MIN_TOKENS_KEY = "dp_load_prefill_min_tokens"
 _DP_LOAD_PREFILL_AWARE_DEFAULT = False
+_DP_LOAD_PREFILL_MIN_TOKENS_DEFAULT = 8192
 _DP_LOAD_PREFILL_TOKENS_PER_UNIT_DEFAULT = 2048
 
 
-def get_tt_dp_load_config(vllm_config: "VllmConfig") -> tuple[bool, int]:
-    """Return ``(prefill_aware, tokens_per_unit)`` for DP load reporting."""
+def get_tt_dp_load_config(vllm_config: "VllmConfig") -> tuple[bool, int, int]:
+    """Return ``(prefill_aware, tokens_per_unit, min_tokens)`` for DP load."""
     tt_config = get_tt_config(vllm_config)
+    min_tokens = tt_config.get(
+        _DP_LOAD_PREFILL_MIN_TOKENS_KEY, _DP_LOAD_PREFILL_MIN_TOKENS_DEFAULT
+    )
+    if isinstance(min_tokens, bool) or not isinstance(min_tokens, int) or min_tokens < 0:
+        raise ValueError(
+            f"additional_config['tt']['{_DP_LOAD_PREFILL_MIN_TOKENS_KEY}'] must "
+            f"be an integer >= 0, got {min_tokens!r}"
+        )
     return (
         _read_tt_bool(
             tt_config,
@@ -736,6 +748,7 @@ def get_tt_dp_load_config(vllm_config: "VllmConfig") -> tuple[bool, int]:
             _DP_LOAD_PREFILL_TOKENS_PER_UNIT_KEY,
             _DP_LOAD_PREFILL_TOKENS_PER_UNIT_DEFAULT,
         ),
+        min_tokens,
     )
 
 

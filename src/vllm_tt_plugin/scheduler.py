@@ -384,6 +384,7 @@ class TTScheduler(AsyncScheduler):
         (
             self._dp_load_prefill_aware,
             self._dp_load_tokens_per_unit,
+            self._dp_load_min_tokens,
         ) = get_tt_dp_load_config(self.vllm_config)
         (
             self._long_prefill_threshold,
@@ -824,18 +825,30 @@ class TTScheduler(AsyncScheduler):
         With ``dp_load_prefill_aware`` the waiting count grows by one unit per
         ``dp_load_prefill_tokens_per_unit`` pending prefill tokens (waiting
         requests and running partial prefills), so a rank facing a long prefill
-        looks busy before the blocking step starts.
+        looks busy before the blocking step starts. A request counts only if
+        its pending tokens are at least ``dp_load_prefill_min_tokens``; with
+        none above it the base counts are returned unchanged.
         """
         running, waiting = super().get_request_counts()
         if not getattr(self, "_dp_load_prefill_aware", False):
             return running, waiting
-        pending = sum(self._pending_prefill_tokens(r, True) for r in self.waiting)
+        min_tokens = self._dp_load_min_tokens
+        pending = 0
+        for r in self.waiting:
+            n = self._pending_prefill_tokens(r, True)
+            if n >= min_tokens:
+                pending += n
         skipped = getattr(self, "skipped_waiting", None)
         if skipped is not None:
-            pending += sum(self._pending_prefill_tokens(r, True) for r in skipped)
-        pending += sum(
-            self._pending_prefill_tokens(r) for r in self.running if r.is_prefill_chunk
-        )
+            for r in skipped:
+                n = self._pending_prefill_tokens(r, True)
+                if n >= min_tokens:
+                    pending += n
+        for r in self.running:
+            if r.is_prefill_chunk:
+                n = self._pending_prefill_tokens(r)
+                if n >= min_tokens:
+                    pending += n
         penalty = -(-pending // self._dp_load_tokens_per_unit)
         return running, waiting + penalty
 
