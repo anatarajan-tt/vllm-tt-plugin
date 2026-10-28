@@ -1029,7 +1029,7 @@ class TTAsyncDecodeController:
                 "%d verify in topk mode, %d verify in fused mode; "
                 "topk fallback: %d/%d positions overflow, %d fetches in %d support steps"
                 "; real drafts: %d valid, %d accepted over %d verify rows"
-                "%s",
+                "%s%s",
                 self._ordinary_decode_submissions,
                 self._verify_submissions,
                 self._overlapped_submissions,
@@ -1044,7 +1044,13 @@ class TTAsyncDecodeController:
                 self._accepted_drafts,
                 self._verify_rows,
                 self._chain_report(),
+                self._logits_reasons_report(),
             )
+
+    def _logits_reasons_report(self) -> str:
+        """The runner's logits-mode reason counters, empty when they are off."""
+        report = getattr(self.runner, "logits_mode_report", None)
+        return report() if callable(report) else ""
 
     def _chain_report(self) -> str:
         """The chain counters for the submission line, empty when chaining is off."""

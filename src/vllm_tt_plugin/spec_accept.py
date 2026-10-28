@@ -541,9 +541,15 @@ def accept_sampled_support(
     ``[1, M-1]``; a position whose tie group at the k-th value reaches the
     M-th candidate cannot be decided from the support (a member may be
     missing), and such positions are sampled from ``fetch_logits()`` by the
-    reference path, called at most once per step. The penalties, the token
-    filters, the grammar and logprobs all need the full vocabulary and are
-    refused here: ``params_support_servable`` keeps such rows off this walk.
+    reference path, called at most once per step. The token filters, the
+    grammar and logprobs all need the full vocabulary and are refused here:
+    ``params_support_servable`` keeps such rows off this walk. Penalties are
+    refused too unless VLLM_TT_SPEC_TOPK_PENALTIES is on and each can only
+    lower a logit (``topk_penalties_enabled``): then vLLM's penalty op is
+    applied to the candidates (``_penalize_support``), a position is decided
+    from them only when its k-th penalized value is above the smallest raw
+    candidate (which bounds every penalized logit outside the support), and
+    the rest are sampled from the fetched logits after the same op.
 
     VLLM_TT_SPEC_TOPK_AUDIT=1 fetches the full logits on every step and checks
     the support table against the full-logits table, for device validation.
@@ -575,6 +581,23 @@ def accept_sampled_support(
     if bool(is_greedy.any()):
         greedy = _greedy_accept(argmax_ids.to(torch.int32), draft_token_ids, num_drafts)
     if bool((~is_greedy).any()):
+        outside_max = None
+        if sampling.penalties is not None:
+            # _check_support_inputs admitted them: VLLM_TT_SPEC_TOPK_PENALTIES
+            # is on and every penalty can only lower a logit.
+            outside_max = topk_values.to(torch.float32).amin(dim=-1).reshape(-1)
+            topk_values = _penalize_support(
+                topk_values,
+                topk_ids,
+                draft_token_ids,
+                num_valid_drafts,
+                sampling.penalties,
+                vocab,
+            )
+            if fetch is not None:
+                fetch = _PenalizedFetch(
+                    fetch, draft_token_ids, num_valid_drafts, sampling.penalties
+                )
         table = _support_table(
             topk_values,
             topk_ids,
@@ -583,6 +606,7 @@ def accept_sampled_support(
             sampling.top_p,
             vocab,
             fetch,
+            outside_max,
         )
         if _audit_enabled():
             _SUPPORT_STATS.add(audit_steps=1)
@@ -630,6 +654,108 @@ def params_support_servable(params: Any, output_len: int, candidates: int) -> bo
         or bool(params.bad_words_token_ids)
         or (params.min_tokens > output_len and bool(params.all_stop_token_ids))
     )
+
+
+def topk_penalties_enabled() -> bool:
+    """Whether a ``topk`` verify may carry rows with penalties.
+
+    VLLM_TT_SPEC_TOPK_PENALTIES (default 0; 1 turns it on). A presence or
+    frequency penalty of at least 0 and a repetition penalty of at least 1 can
+    only lower a logit (``penalties_lower_only``), so every token outside the
+    top-M support keeps a penalized logit at or below the support's smallest
+    raw logit. The walk applies vLLM's penalty op to the M candidates and
+    commits from them when the row's k-th penalized value is above that bound;
+    a position where it is not is sampled from the full penalized logits
+    (``fetch_logits``), as a tie overflow is. Off, any penalized row sends its
+    step to the ``logits`` mode, as before.
+    """
+    return os.environ.get("VLLM_TT_SPEC_TOPK_PENALTIES", "0") not in ("", "0")
+
+
+def logits_reasons_enabled() -> bool:
+    """Whether the runner counts why each ``logits`` verify could not be ``topk``.
+
+    VLLM_TT_SPEC_LOGITS_REASONS (default 0; 1 turns it on). The counts are
+    appended to the periodic "TT submissions" line (``logits_mode_reasons``).
+    """
+    return os.environ.get("VLLM_TT_SPEC_LOGITS_REASONS", "0") not in ("", "0")
+
+
+def penalties_lower_only(presence: float, frequency: float, repetition: float) -> bool:
+    """True when the penalties can only lower a logit, never raise one.
+
+    vLLM's op multiplies a positive logit by ``1 / repetition`` and a negative
+    one by ``repetition``, then subtracts ``frequency * count`` and
+    ``presence * seen``. With ``repetition >= 1``, ``frequency >= 0`` and
+    ``presence >= 0`` each step moves a logit down or leaves it, and IEEE
+    rounding of a product with a factor at most 1, or of a difference with a
+    non-negative subtrahend, cannot move it up either.
+    """
+    return (
+        float(presence) >= 0.0 and float(frequency) >= 0.0 and float(repetition) >= 1.0
+    )
+
+
+def logits_mode_reasons(
+    params: Any,
+    output_len: int,
+    candidates: int | None,
+    *,
+    penalized: bool,
+    penalties_on_support: bool,
+) -> tuple[str, ...]:
+    """Why a request cannot be served by an ``argmax_ids`` or ``topk`` verify.
+
+    Empty when the request is greedy-certifiable or support-servable under the
+    current switches. Otherwise the controls that each need the full
+    vocabulary, so a step carrying the row runs in the ``logits`` mode:
+
+    - ``logprobs``, ``grammar``, ``allowed_token_ids``, ``bad_words``,
+      ``min_tokens``: the controls ``params_support_servable`` refuses.
+    - ``penalties``: a penalized row the support walk does not take (the
+      switch is off, the row is greedy, or a penalty can raise a logit).
+    - ``top_k_unset_top_p``: sampled with no top_k but a top_p below 1, which
+      a device log-sum-exp could serve from the support (plan item DEV-LSE).
+    - ``top_k_unset``: sampled from the whole vocabulary (no top_k, no top_p).
+    - ``top_k_large``: sampled with a top_k of at least ``candidates``.
+    - ``no_topk``: none of the above, but the launch offers no ``topk`` mode.
+
+    ``params`` is vLLM's ``SamplingParams``; ``penalized`` says whether the
+    runner's batch lists the request in a penalty set.
+    """
+    if params is None:
+        return ()
+    reasons: list[str] = []
+    greedy = float(params.temperature) < 1e-5
+    if params.logprobs is not None:
+        reasons.append("logprobs")
+    if params.structured_outputs is not None:
+        reasons.append("grammar")
+    if params.allowed_token_ids:
+        reasons.append("allowed_token_ids")
+    if params.bad_words_token_ids:
+        reasons.append("bad_words")
+    if params.min_tokens > output_len and params.all_stop_token_ids:
+        reasons.append("min_tokens")
+    if penalized and not (
+        penalties_on_support
+        and not greedy
+        and penalties_lower_only(
+            params.presence_penalty, params.frequency_penalty, params.repetition_penalty
+        )
+    ):
+        reasons.append("penalties")
+    if not greedy:
+        top_k = int(params.top_k)
+        if top_k < 1:
+            reasons.append(
+                "top_k_unset_top_p" if float(params.top_p) < 1.0 else "top_k_unset"
+            )
+        elif candidates is not None and top_k > candidates - 1:
+            reasons.append("top_k_large")
+    if not reasons and not greedy and candidates is None:
+        reasons.append("no_topk")
+    return tuple(reasons)
 
 
 def device_topk_enabled() -> bool:
@@ -1201,6 +1327,7 @@ def _support_cut(
     k: torch.Tensor,
     p: torch.Tensor | None,
     can_overflow: bool | torch.Tensor,
+    outside_max: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Top-k (ties kept) then top-p on per-position candidates.
 
@@ -1212,6 +1339,12 @@ def _support_cut(
     a tie group at the k-th value that reaches the last candidate may have
     members past it, unless ``can_overflow`` says the candidates are the
     whole vocabulary (or, per position, that the cut is not read at all).
+
+    ``outside_max`` (``[n]`` raw values, or None) bounds every logit outside
+    the candidates when the candidates are no longer the top values of the
+    logits being cut (penalized candidates): the tie test then compares the
+    k-th value with that bound instead of with the last candidate. For
+    unpenalized candidates the bound is the last candidate, so both agree.
     """
     cand = int(vals.shape[1])
     if not _tie_exact():
@@ -1226,7 +1359,10 @@ def _support_cut(
     keep = vals >= kth
     # Candidates cannot show how many logits tie with the k-th beyond
     # the last one they hold, unless that tie is -inf (probability 0).
-    overflow = ((vals[:, -1:] >= kth) & (kth > float("-inf"))).squeeze(1)
+    last = vals[:, -1:]
+    if outside_max is not None:
+        last = outside_max.to(torch.float32).unsqueeze(1) / temp.unsqueeze(1)
+    overflow = ((last >= kth) & (kth > float("-inf"))).squeeze(1)
     overflow = overflow & torch.as_tensor(can_overflow)
     vals = vals.masked_fill(~keep, float("-inf"))
     if p is not None:
@@ -1295,6 +1431,101 @@ class _FetchOnce:
         return self.logits
 
 
+class _PenalizedFetch:
+    """A ``_FetchOnce`` whose logits carry the step's penalties.
+
+    The overflow fallback and the audit compare against the logits the
+    ``logits`` mode would walk, which ``accept_sampled_drafts`` penalizes in
+    fp32 column by column; this applies the same op to the same fp32 logits.
+    """
+
+    def __init__(
+        self,
+        fetch: _FetchOnce,
+        draft_token_ids: torch.Tensor,
+        num_valid_drafts: torch.Tensor,
+        penalties: SpecPenalties,
+    ):
+        self._fetch = fetch
+        self._drafts, self._valid, self._penalties = (
+            draft_token_ids,
+            num_valid_drafts,
+            penalties,
+        )
+        self.logits: torch.Tensor | None = None
+
+    @property
+    def calls(self) -> int:
+        return self._fetch.calls
+
+    def __call__(self) -> torch.Tensor:
+        if self.logits is None:
+            self.logits = apply_speculative_penalties(
+                self._fetch(), self._drafts, self._valid, self._penalties
+            )
+        return self.logits
+
+
+def _penalize_support(
+    topk_values: torch.Tensor,
+    topk_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_valid_drafts: torch.Tensor,
+    penalties: SpecPenalties,
+    vocab: int,
+) -> torch.Tensor:
+    """``apply_speculative_penalties`` restricted to each column's M candidates.
+
+    vLLM's penalty op reads a token's logit, whether it is in the prompt, and
+    its count in the column's history, and nothing else, elementwise. So the
+    op is run on ``[B * (1+K), M]`` fp32 candidate values with every prompt id
+    and history id renumbered to its candidate slot (ids outside the
+    candidates dropped, the prompt padded with M, the op's ignored index):
+    each candidate gets the mask, the count and the arithmetic it gets in the
+    full-vocabulary op, so its penalized value is bit-identical. Column ``j``'s
+    history is the committed output plus the first ``min(j, valid)`` drafts.
+    """
+    from vllm.v1.sample.ops.penalties import apply_all_penalties
+
+    rows, width, m = (int(size) for size in topk_values.shape)
+    ids = topk_ids.to(torch.int64)
+    slots = torch.arange(m, dtype=torch.int64)
+    prompt_local = torch.full((rows * width, m), m, dtype=torch.int64)
+    histories: list[list[int]] = []
+    for row in range(rows):
+        prompt = penalties.prompt_token_ids[row].to(torch.int64)
+        prompt = prompt[(prompt >= 0) & (prompt < vocab)]
+        in_prompt = torch.zeros(vocab, dtype=torch.bool)
+        in_prompt[prompt] = True
+        committed = torch.as_tensor(penalties.output_token_ids[row], dtype=torch.int64)
+        committed = committed[(committed >= 0) & (committed < vocab)]
+        counts = torch.bincount(committed, minlength=vocab)
+        valid = int(num_valid_drafts[row])
+        drafts = draft_token_ids[row, :valid].to(torch.int64)
+        for column in range(width):
+            cand = ids[row, column]
+            flat = row * width + column
+            prompt_local[flat] = torch.where(in_prompt[cand], slots, m)
+            local = counts[cand]
+            seen = drafts[: min(column, valid)]
+            if seen.numel():
+                local = local + (cand.unsqueeze(1) == seen.unsqueeze(0)).sum(dim=1)
+            histories.append(slots.repeat_interleave(local).tolist())
+
+    def per_column(per_row: torch.Tensor) -> torch.Tensor:
+        return per_row.repeat_interleave(width, dim=0)
+
+    flat_values = apply_all_penalties(
+        topk_values.reshape(rows * width, m).to(torch.float32).clone(),
+        prompt_local,
+        per_column(penalties.presence),
+        per_column(penalties.frequency),
+        per_column(penalties.repetition),
+        histories,
+    )
+    return flat_values.reshape(rows, width, m)
+
+
 def _support_table(
     topk_values: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -1302,7 +1533,8 @@ def _support_table(
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
     vocab: int,
-    fetch: _FetchOnce | None,
+    fetch: "_FetchOnce | _PenalizedFetch | None",
+    outside_max: torch.Tensor | None = None,
 ) -> _ProbTable:
     """``_constrained_table`` from a verify's exact top-M support.
 
@@ -1318,6 +1550,15 @@ def _support_table(
     the walk stay in step with the full-logits walk; their results are
     discarded, so they take the whole support at temperature 1 with no cut
     and can never overflow.
+
+    ``outside_max`` (``[B * (1+K)]``) is the raw bound on every logit outside
+    the support, passed when ``topk_values`` are penalized (``_support_cut``).
+    With it, a step with any undecidable position builds its whole table from
+    the fetched (penalized) logits with ``_constrained_table``, which is the
+    table the ``logits`` walk builds, so that step commits exactly what the
+    ``logits`` mode would: a penalty can push a position off the support far
+    more often than a tie does, and the reference path's dense rows draw the
+    same distribution through a different inverse CDF.
     """
     rows, width, m = topk_values.shape
     n = rows * width
@@ -1342,11 +1583,24 @@ def _support_table(
     else:
         k_eff = torch.where(servable, k, m)
     p_eff = None if p is None else torch.where(servable, p, torch.ones_like(p))
-    vals, idx, overflow = _support_cut(flat_v, flat_i, temp, k_eff, p_eff, servable)
+    vals, idx, overflow = _support_cut(
+        flat_v, flat_i, temp, k_eff, p_eff, servable, outside_max
+    )
 
     table = _ProbTable(n, vocab)
     ok = ~overflow
     _SUPPORT_STATS.add(overflow_positions=int(overflow.sum()))
+    if outside_max is not None and bool(overflow.any()):
+        if fetch is None:
+            raise ValueError(
+                "accept_sampled_support: penalized positions "
+                f"{overflow.nonzero().view(-1).tolist()} cannot be decided from "
+                f"the {m} candidates and need the full logits, but the verify "
+                "offered no fetch_logits"
+            )
+        return _constrained_table(
+            fetch().reshape(rows, width, vocab), temperature, top_k, top_p, None
+        )
     if bool(ok.any()):
         probs = vals[ok].softmax(dim=-1, dtype=torch.float32)
         table.set_sparse(ok.nonzero().squeeze(1), idx[ok], probs)
@@ -1788,10 +2042,33 @@ def _check_support_inputs(
         None,
     )
     _check_sampling(sampling, rows, width, vocab)
+    penalties = sampling.penalties
+    if penalties is not None and topk_penalties_enabled():
+        lowering = (
+            (penalties.presence >= 0.0)
+            & (penalties.frequency >= 0.0)
+            & (penalties.repetition >= 1.0)
+        )
+        neutral = (
+            (penalties.presence == 0.0)
+            & (penalties.frequency == 0.0)
+            & (penalties.repetition == 1.0)
+        )
+        greedy = sampling.temperature <= 0.0
+        bad = ~lowering | (greedy & ~neutral)
+        if bool(bad.any()):
+            raise ValueError(
+                "accept_sampled_support rows "
+                f"{bad.nonzero().view(-1).tolist()} carry a penalty that can raise "
+                "a logit, or a penalty on a greedy row, which the support cannot "
+                "certify; the runner routes such rows to the logits mode"
+            )
+        # Served by _penalize_support below.
+        penalties = None
     unsupported = [
         name
         for name, value in (
-            ("penalties", sampling.penalties),
+            ("penalties", penalties),
             ("filters", sampling.filters),
             ("num_logprobs", sampling.num_logprobs),
         )

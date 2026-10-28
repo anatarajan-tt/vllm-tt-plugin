@@ -86,10 +86,14 @@ from vllm_tt_plugin.spec_accept import (
     device_topk_enabled,
     fused_sample_enabled,
     fused_sampled_enabled,
+    logits_mode_reasons,
+    logits_reasons_enabled,
     params_support_servable,
+    penalties_lower_only,
     predraw_uniforms,
     spec_chain_enabled,
     spec_chain_sampled_enabled,
+    topk_penalties_enabled,
 )
 from vllm_tt_plugin.spec_admission import method_requirements
 from vllm_tt_plugin.spec_decode import (
@@ -1982,11 +1986,19 @@ class TTModelRunner:
         """
         modes = getattr(self, "_spec_accept_modes", ()) or (ACCEPT_MODE_ARGMAX_IDS,)
         certifiable = [self._request_is_argmax_certifiable(r) for r in row_req_ids]
-        support_ok = (
-            ACCEPT_MODE_TOPK in modes
-            and device_topk_enabled()
+        topk_offered = ACCEPT_MODE_TOPK in modes and device_topk_enabled()
+        support_ok = topk_offered and all(
+            ok or self._request_is_support_servable(req_id)
+            for ok, req_id in zip(certifiable, row_req_ids)
+        )
+        # The host support walk can also apply lowering penalties
+        # (VLLM_TT_SPEC_TOPK_PENALTIES); the device's fused accept cannot, so
+        # this widens ``topk`` only, never ``fused_sample``.
+        support_with_penalties_ok = support_ok or (
+            topk_offered
+            and topk_penalties_enabled()
             and all(
-                ok or self._request_is_support_servable(req_id)
+                ok or self._request_is_support_servable(req_id, penalties_ok=True)
                 for ok, req_id in zip(certifiable, row_req_ids)
             )
         )
@@ -2010,9 +2022,81 @@ class TTModelRunner:
             return ACCEPT_MODE_LOGITS
         if all(certifiable):
             return ACCEPT_MODE_ARGMAX_IDS
-        if support_ok:
+        if support_with_penalties_ok:
             return ACCEPT_MODE_TOPK
         return ACCEPT_MODE_LOGITS
+
+    def _note_logits_mode_reasons(self, row_req_ids: list[str]) -> None:
+        """Count why a ``logits`` verify could not run as ``topk``.
+
+        VLLM_TT_SPEC_LOGITS_REASONS=1 only. Per reason, the number of logits
+        steps with at least one row carrying it (a step can count under several),
+        plus the rows that forced the mode and the rows those steps carried, which
+        is the share of users slowed by a neighbour. ``logits_mode_report`` puts
+        them on the periodic submission line.
+        """
+        plan = getattr(self, "_spec_plan", None)
+        modes = getattr(self, "_spec_accept_modes", ()) or ()
+        candidates = (
+            int(plan.topk_candidates)
+            if plan is not None
+            and plan.topk_candidates is not None
+            and ACCEPT_MODE_TOPK in modes
+            and device_topk_enabled()
+            else None
+        )
+        batch = self.input_batch
+        penalty_sets = [
+            getattr(batch, attr, ())
+            for attr in (
+                "presence_penalties_reqs",
+                "frequency_penalties_reqs",
+                "repetition_penalties_reqs",
+            )
+        ]
+        step_reasons: set[str] = set()
+        offenders = 0
+        for req_id in row_req_ids:
+            if self._request_is_argmax_certifiable(req_id):
+                continue
+            req_state = getattr(self, "requests", {}).get(req_id)
+            params = getattr(req_state, "sampling_params", None)
+            reasons = logits_mode_reasons(
+                params,
+                len(req_state.output_token_ids) if req_state is not None else 0,
+                candidates,
+                penalized=any(req_id in reqs for reqs in penalty_sets),
+                penalties_on_support=topk_penalties_enabled(),
+            )
+            if params is None or not reasons:
+                # Not certifiable for a reason the sampling params do not
+                # show (a random_reqs entry without params).
+                reasons = ("unknown",)
+            offenders += 1
+            step_reasons.update(reasons)
+        counts = self.__dict__.setdefault("_logits_mode_reason_counts", {})
+        for reason in step_reasons:
+            counts[reason] = counts.get(reason, 0) + 1
+        self._logits_mode_steps = self.__dict__.get("_logits_mode_steps", 0) + 1
+        self._logits_mode_offending_rows = (
+            self.__dict__.get("_logits_mode_offending_rows", 0) + offenders
+        )
+        self._logits_mode_step_rows = self.__dict__.get(
+            "_logits_mode_step_rows", 0
+        ) + len(row_req_ids)
+
+    def logits_mode_report(self) -> str:
+        """The logits-mode reason counters for the submission line, empty when off."""
+        if not logits_reasons_enabled():
+            return ""
+        counts = self.__dict__.get("_logits_mode_reason_counts", {})
+        reasons = ", ".join(f"{name}={n}" for name, n in sorted(counts.items()))
+        return (
+            f"; logits reasons: {self.__dict__.get('_logits_mode_steps', 0)} steps, "
+            f"{self.__dict__.get('_logits_mode_offending_rows', 0)}/"
+            f"{self.__dict__.get('_logits_mode_step_rows', 0)} rows forcing"
+            + (f" ({reasons})" if reasons else "")
+        )
 
     def _seeded_row_without_drafts(
         self, row_req_ids: list[str], num_valid_drafts: Any
@@ -2031,28 +2115,45 @@ class TTModelRunner:
                 return True
         return False
 
-    def _request_is_support_servable(self, req_id: str) -> bool:
+    def _request_is_support_servable(
+        self, req_id: str, penalties_ok: bool = False
+    ) -> bool:
         """True when a ``topk`` verify's candidates can sample this request.
 
         The penalties are read off the batch's sets, as the greedy gate reads
         them; the rest off the request's own parameters
         (``params_support_servable``), against the model's declared candidate
-        count.
+        count. ``penalties_ok`` admits a penalized row that samples (not
+        greedy) with penalties that can only lower a logit
+        (``penalties_lower_only``), which the host support walk applies itself;
+        only the ``topk`` mode asks for it.
         """
         plan = getattr(self, "_spec_plan", None)
         if plan is None or plan.topk_candidates is None:
             return False
         batch = self.input_batch
-        for attr in (
-            "presence_penalties_reqs",
-            "frequency_penalties_reqs",
-            "repetition_penalties_reqs",
-        ):
-            if req_id in getattr(batch, attr, ()):
-                return False
+        penalized = any(
+            req_id in getattr(batch, attr, ())
+            for attr in (
+                "presence_penalties_reqs",
+                "frequency_penalties_reqs",
+                "repetition_penalties_reqs",
+            )
+        )
+        if penalized and not penalties_ok:
+            return False
         req_state = getattr(self, "requests", {}).get(req_id)
         params = getattr(req_state, "sampling_params", None)
         if params is None:
+            return False
+        if penalized and (
+            float(params.temperature) < 1e-5
+            or not penalties_lower_only(
+                params.presence_penalty,
+                params.frequency_penalty,
+                params.repetition_penalty,
+            )
+        ):
             return False
         return params_support_servable(
             params, len(req_state.output_token_ids), plan.topk_candidates
@@ -2703,6 +2804,8 @@ class TTModelRunner:
                     spec_mode = self._spec_mode_for_step(
                         row_req_ids, num_valid_drafts
                     )
+                    if spec_mode == ACCEPT_MODE_LOGITS and logits_reasons_enabled():
+                        self._note_logits_mode_reasons(row_req_ids)
                     # Uniformly 1+K wide, so a model needs one verify shape
                     # rather than two.
                     input_tokens, input_positions = self._spec_candidate_block(
