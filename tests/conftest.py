@@ -67,12 +67,22 @@ def reset_tt_platform_class_state():
     # finish_reason in every later test.
     import vllm.parser.qwen3 as qwen3
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
-    from vllm.parser.engine import parser_engine
+    from vllm.parser.engine import adapters, parser_engine
 
     tool_call_targets = (
         (parser_engine, "find_tool_properties", "_tt_original_find_tool_properties"),
         (parser_engine, "coerce_to_schema_type", "_tt_original_coerce_to_schema_type"),
         (qwen3, "_qwen3_arg_converter", "_tt_original_qwen3_arg_converter"),
+        (
+            parser_engine.ParserEngine,
+            "_compute_arg_delta",
+            "_tt_original_compute_arg_delta",
+        ),
+        (
+            adapters.ParserEngineReasoningAdapter,
+            "count_reasoning_tokens",
+            "_tt_original_count_reasoning_tokens",
+        ),
         (
             OpenAIServingChat,
             "chat_completion_stream_generator",

@@ -15,6 +15,10 @@ target is missing, so a vLLM upgrade that moves the target fails at startup.
 - P3: the final conversion drops a last ``<parameter>`` that has no
   ``</parameter>`` (vLLM #57699).
 - P4: a ``["string", ...]`` union turns "007" into 7 (vLLM #62252).
+- P5: streamed argument conversion is O(n) per delta, so a long argument costs
+  O(n^2) per stream (incremental ``_compute_arg_delta``).
+- P6: ``count_reasoning_tokens`` re-parses the whole output per delta when
+  thinking is disabled (the count is always 0 there).
 
 TODO: remove each patch once the matching upstream fix is in the pinned vLLM.
 """
@@ -23,7 +27,6 @@ import copy
 import functools
 import inspect
 import json
-import re
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 
@@ -36,11 +39,17 @@ _SCHEMA_CACHE_SIZE = 64
 
 
 def install_tool_call_fixes() -> None:
-    """Install the four tool-call patches. Safe to call more than once."""
+    """Install the tool-call patches. Safe to call more than once."""
     _install_tool_schema_deref_patch()
     _install_tool_finish_reason_patch()
     _install_unclosed_parameter_patch()
     _install_string_union_patch()
+    _install_arg_delta_patch()
+    _install_reasoning_count_patch()
+    logger.info(
+        "tool-call fixes active: P1 P2 P3 P4 P5(arg delta fast path) "
+        "P6(reasoning count short-circuit)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +310,25 @@ def _install_tool_finish_reason_patch() -> None:
 # P3: keep a last <parameter> that has no </parameter>.
 # ---------------------------------------------------------------------------
 
-_TRAILING_CLOSERS_RE = re.compile(r"\s*</\s*(?:function|tool_call)\s*>\s*$")
+
+def _strip_one_closer(value: str) -> str | None:
+    """Drop one trailing ``</function>`` or ``</tool_call>`` and its whitespace.
+
+    Same result as removing a match of ``\\s*</\\s*(?:function|tool_call)\\s*>\\s*$``
+    but linear: that regex is quadratic on a long whitespace run. Returns None
+    when the value has no trailing closer. No whitespace may sit between "<"
+    and "/".
+    """
+    stripped = value.rstrip()
+    if not stripped.endswith(">"):
+        return None
+    head = stripped[:-1].rstrip()
+    for name in ("function", "tool_call"):
+        if head.endswith(name):
+            before = head[: -len(name)].rstrip()
+            if before.endswith("/") and before[:-1].endswith("<"):
+                return before[:-2].rstrip()
+    return None
 
 
 def _install_unclosed_parameter_patch() -> None:
@@ -326,14 +353,168 @@ def _install_unclosed_parameter_patch() -> None:
         if match is None or not match.group(1):
             return result
         value = match.group(2)
-        while _TRAILING_CLOSERS_RE.search(value):
-            value = _TRAILING_CLOSERS_RE.sub("", value)
+        while (stripped := _strip_one_closer(value)) is not None:
+            value = stripped
         params = json.loads(result)
         params[match.group(1)] = trim(value)
         return json.dumps(params, ensure_ascii=False)
 
     qwen3._qwen3_arg_converter = arg_converter
     qwen3.qwen3_config.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# P5: incremental streamed argument conversion.
+# ---------------------------------------------------------------------------
+
+
+class _ArgAnchor:
+    """Per tool slot: where the open string parameter has been emitted to."""
+
+    __slots__ = ("slot", "args_len", "emitted_end", "trim_start", "last_lt")
+
+
+def _install_arg_delta_patch() -> None:
+    """Make ``ParserEngine._compute_arg_delta`` O(delta) for an open string value.
+
+    The original converts the whole argument text on every delta. For an open
+    parameter whose type is string, the text streamed so far is
+    ``json.dumps(trim(value))[1:-1]`` and JSON escaping is per character, so a
+    new delta only appends the escape of the new characters. A trailing "\\n"
+    is held back (the converter trims it). Any closer, duplicate key,
+    non-string key or mismatch runs the original once and re-anchors.
+    Must be installed after P3: it only applies when the engine uses the P3
+    converter.
+    """
+    from vllm.parser import qwen3
+    from vllm.parser.engine import parser_engine
+
+    owner = parser_engine.ParserEngine
+    if hasattr(owner, "_tt_original_compute_arg_delta"):
+        return
+    original = owner._compute_arg_delta
+    owner._tt_original_compute_arg_delta = original
+    regex = qwen3.re  # the module qwen3 uses for its patterns
+    close_re = regex.compile(r"<\s*/\s*parameter\s*>|<\s*parameter\s*=")
+    pending_re = regex.compile(r"<[\s/aemoprt]*\Z")  # a tag start not yet complete
+    param_re = qwen3._PARAM_RE
+    partial_param_re = qwen3._PARTIAL_PARAM_RE
+
+    def esc(text: str) -> str:
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    def try_anchor(self, idx, slot, args, anchors) -> None:
+        match = partial_param_re.search(param_re.sub("", args))
+        if match is None or not match.group(1):
+            return
+        name, value = match.group(1), match.group(2)
+        if not value:
+            return
+        if slot.string_keys is not None and name not in slot.string_keys:
+            return
+        if name in [m.group(1) for m in param_re.finditer(args)]:
+            return  # duplicate key: the dict position moves
+        value_start = len(args) - len(value)
+        if (
+            close_re.search(args, value_start) is not None
+            or _strip_one_closer(args) is not None
+        ):
+            return
+        trim_start = value_start + (1 if args[value_start] == "\n" else 0)
+        end = max(trim_start, len(args) - (1 if args.endswith("\n") else 0))
+        streamed = slot.streamed_json
+        text = esc(args[trim_start:end])
+        key_prefix = json.dumps(name, ensure_ascii=False) + ': "'
+        if not (
+            streamed.endswith(text)
+            and streamed[: len(streamed) - len(text)].endswith(key_prefix)
+        ):
+            return
+        anchor = _ArgAnchor()
+        anchor.slot = slot
+        anchor.args_len = len(args)
+        anchor.emitted_end = end
+        anchor.trim_start = trim_start
+        anchor.last_lt = args.rfind("<", value_start)
+        anchors[idx] = anchor
+
+    def compute_arg_delta(self, idx, raw_delta):
+        if (
+            self._arg_converter is not qwen3._qwen3_arg_converter
+            or not hasattr(qwen3, "_tt_original_qwen3_arg_converter")
+            or not self._stream_arg_deltas
+            or self._arg_structural_chars is not None
+        ):
+            return original(self, idx, raw_delta)
+        slot = self._tool_slots[idx]
+        args = slot.args
+        anchors = self.__dict__.setdefault("_tt_anchor", {})
+        anchor = anchors.get(idx)
+        if (
+            anchor is not None
+            and anchor.slot is slot
+            and anchor.args_len == len(args) - len(raw_delta)
+        ):
+            old_len = anchor.args_len
+            last_lt = anchor.last_lt
+            start = (
+                last_lt
+                if last_lt >= 0 and pending_re.match(args, last_lt, old_len)
+                else old_len
+            )
+            if close_re.search(args, start) is None and (
+                ">" not in raw_delta or _strip_one_closer(args) is None
+            ):
+                found = args.rfind("<", old_len)
+                if found >= 0:
+                    anchor.last_lt = found
+                end = len(args) - (1 if args.endswith("\n") else 0)
+                end = max(end, anchor.trim_start)
+                anchor.args_len = len(args)
+                if end <= anchor.emitted_end:
+                    return None
+                diff = esc(args[anchor.emitted_end : end])
+                anchor.emitted_end = end
+                slot.streamed_json += diff
+                return diff
+        result = original(self, idx, raw_delta)
+        anchors.pop(idx, None)
+        try_anchor(self, idx, slot, args, anchors)
+        return result
+
+    owner._compute_arg_delta = compute_arg_delta
+
+
+# ---------------------------------------------------------------------------
+# P6: skip the reasoning-token re-parse when thinking is disabled.
+# ---------------------------------------------------------------------------
+
+
+def _install_reasoning_count_patch() -> None:
+    """Return 0 from ``count_reasoning_tokens`` when thinking is disabled.
+
+    Without a valid streaming count the adapter decodes and re-parses every
+    generated token on each call. With ``enable_thinking=false`` the engine
+    starts in CONTENT state, which has no transition into reasoning, so the
+    count is always 0.
+    """
+    from vllm.parser.engine import adapters
+
+    owner = adapters.ParserEngineReasoningAdapter
+    if hasattr(owner, "_tt_original_count_reasoning_tokens"):
+        return
+    original = owner.count_reasoning_tokens
+    owner._tt_original_count_reasoning_tokens = original
+
+    def count_reasoning_tokens(self, token_ids):
+        if (
+            not self._streaming_count_valid
+            and getattr(self._parser_engine, "thinking_enabled", True) is False
+        ):
+            return 0
+        return original(self, token_ids)
+
+    owner.count_reasoning_tokens = count_reasoning_tokens
 
 
 # ---------------------------------------------------------------------------
