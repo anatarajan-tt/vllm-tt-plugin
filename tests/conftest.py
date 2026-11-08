@@ -104,6 +104,46 @@ def reset_tt_platform_class_state():
             "_tt_original_chat_completion_full_generator",
         ),
     )
+    # structured_output_fixes, likewise.
+    import vllm.v1.structured_output as so_manager_module
+    from vllm.entrypoints.generate.base import protocol as base_protocol
+    from vllm.entrypoints.openai.chat_completion import protocol as chat_protocol
+    from vllm.entrypoints.openai.completion import protocol as completion_protocol
+    from vllm.renderers.online_renderer import OnlineRenderer
+    from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+
+    convert_marker = "_tt_original_structured_outputs_from_response_format"
+    tool_call_targets += (
+        (base_protocol, "structured_outputs_from_response_format", convert_marker),
+        (chat_protocol, "structured_outputs_from_response_format", convert_marker),
+        (
+            completion_protocol,
+            "structured_outputs_from_response_format",
+            convert_marker,
+        ),
+        (StructuredOutputsParams, "__post_init__", "_tt_original_post_init"),
+        (
+            SamplingParams,
+            "_validate_structured_outputs",
+            "_tt_original_validate_structured_outputs_empty",
+        ),
+        (
+            SamplingParams,
+            "_validate_structured_outputs",
+            "_tt_original_validate_structured_outputs_fallback",
+        ),
+        (
+            so_manager_module.StructuredOutputManager,
+            "grammar_init",
+            "_tt_original_grammar_init",
+        ),
+        (
+            so_manager_module.StructuredOutputManager,
+            "_create_grammar",
+            "_tt_original_create_grammar",
+        ),
+        (OnlineRenderer, "render_chat", "_tt_original_render_chat"),
+    )
     saved_tool_call_targets = [
         (owner, attr, owner.__dict__[attr], marker, marker in owner.__dict__)
         for owner, attr, marker in tool_call_targets
@@ -111,7 +151,9 @@ def reset_tt_platform_class_state():
 
     yield
 
-    for owner, attr, value, marker, had_marker in saved_tool_call_targets:
+    # Reversed, so a target listed twice (two patches of one method) ends at the
+    # value saved first, the pre-test one.
+    for owner, attr, value, marker, had_marker in reversed(saved_tool_call_targets):
         setattr(owner, attr, value)
         if not had_marker and marker in owner.__dict__:
             delattr(owner, marker)

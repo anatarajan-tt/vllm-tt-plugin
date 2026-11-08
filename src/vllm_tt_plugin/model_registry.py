@@ -9,6 +9,7 @@ from vllm_tt_plugin.platform import (
     register_tt_models,
     register_tt_test_models,
 )
+from vllm_tt_plugin.structured_output_fixes import install_structured_output_fixes
 from vllm_tt_plugin.tool_call_fixes import install_tool_call_fixes
 
 __all__ = [
@@ -50,3 +51,7 @@ def register_tt_models_from_plugin() -> None:
     # is first used. The patches target classes and module attributes, so they
     # also work when those modules are already imported.
     install_tool_call_fixes()
+    # The structured-output patches span both processes: request validation
+    # and prompt rendering run in the API server, grammar compilation in the
+    # engine core (StructuredOutputManager), and both load general plugins.
+    install_structured_output_fixes()
