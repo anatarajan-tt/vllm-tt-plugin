@@ -9,6 +9,7 @@ from vllm_tt_plugin.platform import (
     register_tt_models,
     register_tt_test_models,
 )
+from vllm_tt_plugin.preengine_trace import install_preengine_trace
 from vllm_tt_plugin.tool_call_fixes import install_tool_call_fixes
 
 __all__ = [
@@ -50,3 +51,6 @@ def register_tt_models_from_plugin() -> None:
     # is first used. The patches target classes and module attributes, so they
     # also work when those modules are already imported.
     install_tool_call_fixes()
+    # Opt-in (TT_PREENGINE_TRACE=1): per-request time from arrival to the
+    # scheduler queue, logged in the engine core. Nothing is patched when off.
+    install_preengine_trace()
