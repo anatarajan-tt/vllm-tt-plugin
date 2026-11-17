@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
+import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from vllm_tt_plugin.logger import init_tt_logger
@@ -64,6 +65,58 @@ _SUPPORTS_DEVICE_GRAMMAR_KEY = "_tt_supports_device_grammar"
 _SPEC_PLAN_KEY = "_tt_spec_plan"
 _SUPPORTS_STAGE_INPUTS_KEY = "_tt_supports_stage_inputs"
 _SUPPORTS_STAGE_OUTPUTS_KEY = "_tt_supports_stage_outputs"
+_MM_PREFIX_CACHE_KEY = "_tt_mm_prefix_cache"
+
+# Operator switch for multimodal prefix caching (default off). It takes effect
+# only when the model declares model_capabilities["accepts_mm_prefix_cache"].
+MM_PREFIX_CACHE_ENV = "VLLM_TT_MM_PREFIX_CACHE"
+
+
+def mm_prefix_cache_requested() -> bool:
+    """True when the operator set ``VLLM_TT_MM_PREFIX_CACHE=1``."""
+    return os.environ.get(MM_PREFIX_CACHE_ENV, "0") == "1"
+
+
+def resolve_tt_mm_prefix_cache(model_capabilities: dict | None) -> bool:
+    """Multimodal prefix caching is on when requested AND the model accepts it.
+
+    A model that accepts it resumes a multimodal prefill from a cached prefix:
+    it encodes only the mm items that overlap the recomputed suffix, keys its
+    own prefix state by the items' content hashes, and builds M-RoPE positions
+    from the grids of every item (cached ones included). Without the
+    capability the scheduler keeps today's behaviour (multimodal requests never
+    read the prefix cache), so an old model never sees a multimodal prefix hit.
+    """
+    if not mm_prefix_cache_requested():
+        return False
+    if (model_capabilities or {}).get("accepts_mm_prefix_cache", False):
+        return True
+    logger.warning(
+        "%s=1 is ignored: the model does not declare "
+        "model_capabilities['accepts_mm_prefix_cache']; multimodal requests "
+        "keep skipping the prefix cache.",
+        MM_PREFIX_CACHE_ENV,
+    )
+    return False
+
+
+def store_tt_mm_prefix_cache(vllm_config: "VllmConfig", enabled: bool) -> None:
+    """Record the resolved multimodal prefix-cache switch on the config."""
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            f"resolved TT mm_prefix_cache must be a boolean, got {enabled!r}"
+        )
+    additional = getattr(vllm_config, "additional_config", None)
+    if not isinstance(additional, dict):
+        additional = {}
+        vllm_config.additional_config = additional
+    additional[_MM_PREFIX_CACHE_KEY] = enabled
+
+
+def get_tt_mm_prefix_cache(vllm_config: "VllmConfig") -> bool:
+    """Whether multimodal requests may read the prefix cache (default False)."""
+    additional = getattr(vllm_config, "additional_config", None) or {}
+    return bool(additional.get(_MM_PREFIX_CACHE_KEY, False))
 
 
 def get_tt_data_parallel_size(vllm_config: "VllmConfig") -> int:

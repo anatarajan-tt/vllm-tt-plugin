@@ -23,6 +23,7 @@ from vllm_tt_plugin.config import (
     get_tt_dp_load_config,
     get_tt_long_prefill_alone_config,
     get_tt_max_concurrent_partial_prefills,
+    get_tt_mm_prefix_cache,
     get_tt_output_tokens_per_step,
     get_tt_prefill_chunk_alignment,
     get_tt_prefill_chunk_cap_table,
@@ -503,6 +504,10 @@ class TTScheduler(AsyncScheduler):
             )
         self._step_prefill_tokens = 0
         self._warned_mm_over_step = False
+        # VLLM_TT_MM_PREFIX_CACHE=1 and a model that accepts multimodal prefix
+        # hits (see config.resolve_tt_mm_prefix_cache); off = every multimodal
+        # request skips the prefix cache, as before.
+        self._mm_prefix_cache = get_tt_mm_prefix_cache(self.vllm_config)
         self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
         self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
         self._requests_cannot_resume = tt_requests_cannot_resume(self.vllm_config)
@@ -620,12 +625,15 @@ class TTScheduler(AsyncScheduler):
         Rust frontend stays refused: it would send all traffic down this path
         instead of rejecting unsupported requests.
         """
-        if request.mm_features:
+        if request.mm_features and not self._mm_reads_prefix_cache(request):
             # The TT runner re-runs the vision tower from token 0 on every
             # prefill, but vLLM's strip_covered_mm_data drops the pixel payload
             # of any mm item fully covered by a prefix-cache hit. Never read
             # the prefix cache for multimodal requests so payloads stay intact.
             # (A plain attribute, derived once in Request.__init__.)
+            # With multimodal prefix caching on (_mm_reads_prefix_cache), an
+            # image request reads the cache and keeps its payloads instead
+            # (_restore_mm_payloads).
             request.skip_reading_prefix_cache = True
         if self._is_block_output_model:
             existing = self.requests.get(request.request_id)
@@ -644,6 +652,44 @@ class TTScheduler(AsyncScheduler):
                 return
             self._repair_unvalidated_block_request(request)
         super().add_request(request)
+
+    def _mm_reads_prefix_cache(self, request: Request) -> bool:
+        """Whether this multimodal request may read the prefix cache.
+
+        Only with multimodal prefix caching on, and only for image items: a
+        video item interleaves timestamp text with its frames, and its M-RoPE
+        and splice paths have not been validated against a resumed prefill.
+        The block hashes vLLM matches on already carry every image's content
+        hash (``_gen_mm_extra_hash_keys``), so two prompts with the same text
+        and different images never share the blocks that hold or follow an
+        image. A request that keeps the skip is served exactly as before.
+        """
+        if not getattr(self, "_mm_prefix_cache", False):
+            return False
+        return all(
+            getattr(feature, "modality", None) == "image"
+            for feature in request.mm_features
+        )
+
+    def _restore_mm_payloads(self, scheduler_output: SchedulerOutput) -> None:
+        """Send the full mm payloads of a multimodal prefix hit to the worker.
+
+        ``NewRequestData.from_request`` strips the pixel payload of every mm
+        item that lies wholly inside the prefix-cache hit
+        (``strip_covered_mm_data``). The model resumes from its own prefix
+        state at or below the hit, possibly below an item vLLM counted as
+        covered, so it may need that item's pixels. The scheduler-side
+        ``Request`` keeps the full features; hand them over unchanged (the
+        same payload a request that skips the prefix cache sends today).
+        """
+        if not getattr(self, "_mm_prefix_cache", False):
+            return
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.num_computed_tokens <= 0 or not new_req.mm_features:
+                continue
+            request = self.requests.get(new_req.req_id)
+            if request is not None and request.mm_features:
+                new_req.mm_features = request.mm_features
 
     def _repair_unvalidated_block_request(self, request: Request) -> None:
         """Make a block-output request that skipped validation servable.
@@ -1229,6 +1275,7 @@ class TTScheduler(AsyncScheduler):
     def _finalize_scheduler_output(
         self, scheduler_output: SchedulerOutput, *, is_decode: bool
     ) -> SchedulerOutput:
+        self._restore_mm_payloads(scheduler_output)
         if is_decode:
             rows = len(scheduler_output.num_scheduled_tokens)
             if rows > getattr(self, "_widest_decode_batch_size", 0):

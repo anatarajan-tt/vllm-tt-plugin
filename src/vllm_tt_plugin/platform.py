@@ -31,12 +31,14 @@ from vllm_tt_plugin.config import (
     is_tt_adaptive_block_output_model,
     is_tt_block_output_model,
     require_tt_output_tokens_per_step,
+    resolve_tt_mm_prefix_cache,
     resolve_tt_scheduler_cls,
     resolve_tt_supports_stage_outputs,
     store_tt_adaptive_block_max_prompt_tokens,
     store_tt_adaptive_block_output,
     store_tt_block_kv_extent_tokens,
     store_tt_lane_count,
+    store_tt_mm_prefix_cache,
     store_tt_output_tokens_per_step,
     store_tt_prefill_chunk_cap_table_default,
     store_tt_spec_plan,
@@ -1100,6 +1102,38 @@ def _install_tt_input_processor_patch() -> None:
     input_processor.InputProcessor.process_inputs = process_inputs_tt
 
 
+def _install_mm_content_hash_patch() -> None:
+    """Key every multimodal item by its content hash, never by a client uuid.
+
+    vLLM uses a client-supplied ``uuid`` (chat content parts,
+    ``multi_modal_uuids``) as the item's identifier in place of the content
+    hash. The identifier is what the prefix-cache block hashes and the model's
+    own prefix-state keys use. With multimodal prefix caching on, a request
+    that reuses another image's uuid (or the content hash of a public image)
+    would read KV computed from a different image: wrong answers for the
+    client, and cache poisoning across clients. So when multimodal prefix
+    caching is on, the uuids are dropped before hashing and every item is
+    hashed from its pixels (what vLLM already does for requests without
+    uuids). A uuid-only item (no data, a processor-cache reference) then fails
+    validation instead of resolving to a cached item.
+    """
+    import dataclasses
+
+    import vllm.multimodal.processing.inputs as mm_inputs
+
+    if hasattr(mm_inputs, "_tt_original_get_mm_hashes"):
+        return
+    original = mm_inputs.ProcessorInputs.get_mm_hashes
+    mm_inputs._tt_original_get_mm_hashes = original
+
+    def get_mm_hashes_content_only(self, *args, **kwargs):
+        if self.mm_uuid_items:
+            self = dataclasses.replace(self, mm_uuid_items=None)
+        return original(self, *args, **kwargs)
+
+    mm_inputs.ProcessorInputs.get_mm_hashes = get_mm_hashes_content_only
+
+
 def _install_block_output_streaming_input_patch() -> None:
     """Reject streaming-input sessions before vLLM creates a final request."""
     import vllm.v1.engine.async_llm as async_llm
@@ -1998,6 +2032,10 @@ class TTPlatform(Platform):
         store_tt_prefill_chunk_cap_table_default(
             vllm_config, (model_capabilities or {}).get("prefill_chunk_cap_table")
         )
+        mm_prefix_cache = resolve_tt_mm_prefix_cache(model_capabilities)
+        store_tt_mm_prefix_cache(vllm_config, mm_prefix_cache)
+        if mm_prefix_cache:
+            _install_mm_content_hash_patch()
         # Adaptive block-output: the model emits its block ONLY when it decodes
         # alone (batch==1) and falls back to plain batched baseline otherwise,
         # so the max_num_seqs=1 and data-parallel gates below are relaxed for

@@ -44,6 +44,7 @@ from vllm_tt_plugin.async_decode import (
 from vllm_tt_plugin.config import (
     get_tt_data_parallel_size,
     get_tt_max_batch_size,
+    get_tt_mm_prefix_cache,
     get_tt_output_tokens_per_step,
     get_tt_per_lane_max_num_seqs,
     get_tt_seeded_sampling_policy,
@@ -731,6 +732,10 @@ class TTModelRunner:
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.supports_stage_inputs = get_tt_supports_stage_inputs(vllm_config)
+        # Multimodal prefix caching (VLLM_TT_MM_PREFIX_CACHE=1 + a model that
+        # accepts it): prefill rows carry each mm item's placeholder span and
+        # content-hash identifier ("mm_item_spans") next to the payloads.
+        self.mm_prefix_cache = get_tt_mm_prefix_cache(vllm_config)
         self.supports_stage_outputs = get_tt_supports_stage_outputs(vllm_config)
         self.supports_device_grammar = is_tt_device_grammar_preload_eligible(
             vllm_config,
@@ -1614,7 +1619,40 @@ class TTModelRunner:
             multi_modal_kwargs["pixel_values_videos"] = video_pv_rows
             multi_modal_kwargs["video_grid_thw"] = video_grid_rows
 
+        if getattr(self, "mm_prefix_cache", False):
+            # Per row: None (text) or one (offset, length, identifier) per mm
+            # item in mm_features order (= position order). The model keys its
+            # prefix state by the identifiers (the content hashes vLLM's block
+            # hashes carry) and encodes only the items its resumed prefill
+            # reaches.
+            multi_modal_kwargs["mm_item_spans"] = [
+                self._mm_item_spans(self.requests[self.input_batch.req_ids[i]])
+                for i in req_indices
+            ]
+
         return multi_modal_kwargs
+
+    @staticmethod
+    def _mm_item_spans(req_state) -> list[tuple[int, int, str]] | None:
+        features = req_state.mm_features
+        if not features:
+            return None
+        spans = []
+        for feature in features:
+            identifier = feature.identifier
+            if not identifier:
+                raise ValueError(
+                    f"multimodal item at offset {feature.mm_position.offset} has "
+                    f"no identifier; multimodal prefix caching keys on it"
+                )
+            spans.append(
+                (
+                    int(feature.mm_position.offset),
+                    int(feature.mm_position.length),
+                    str(identifier),
+                )
+            )
+        return spans
 
     def _sampling_params_for_padded_decode(
         self,
