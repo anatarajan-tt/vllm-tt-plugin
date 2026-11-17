@@ -10,6 +10,7 @@ from vllm_tt_plugin.platform import (
     register_tt_test_models,
 )
 from vllm_tt_plugin.tool_call_fixes import install_tool_call_fixes
+from vllm_tt_plugin.schema_prompt import install_schema_prompt
 
 __all__ = [
     "register_tt_models",
@@ -50,3 +51,4 @@ def register_tt_models_from_plugin() -> None:
     # is first used. The patches target classes and module attributes, so they
     # also work when those modules are already imported.
     install_tool_call_fixes()
+    install_schema_prompt()
